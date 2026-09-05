@@ -76,9 +76,10 @@ func newIdentityRefreshTestDaemon() *daemon {
 		mesh:               clustertrust.Open(""),
 		http:               &http.Client{Timeout: nodeInfoFetchTimeout},
 		lastInfo:           make(map[string]NodeInfoResponse),
-		lastModels:         make(map[string][]string),
+		lastModels:          make(map[string][]string),
 		lastModelsByEngine: make(map[string]map[string][]string),
 		lastLoadedByEngine: make(map[string]map[string][]string),
+		lastRoutingByEngine: make(map[string]map[string]*noderec.EngineRouting),
 	}
 }
 

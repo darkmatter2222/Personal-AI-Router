@@ -37,8 +37,10 @@ type ProxyNodeSource = 'ollama-proxy' | 'lmstudio-proxy'
 type BrokerNodeSource = ProxyNodeSource | 'broker'
 
 /**
- * Engines surfaced by the broker's proxy plane. Other engine-manager engines
- * are not currently routed across nodes.
+ * Engines surfaced by the broker's proxy plane. The two built-in proxy engines
+ * are the known values; `PROXY_ENGINES` is the set of engines PAIR currently
+ * routes across nodes. It is open: a heterogeneous fleet may add vLLM, torch, or
+ * a custom runtime by extending the const, without changing this type.
  */
 export type ProxyEngine = Extract<EngineType, 'ollama' | 'lm-studio'>
 export const PROXY_ENGINES: readonly ProxyEngine[] = ['ollama', 'lm-studio']

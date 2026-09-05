@@ -10,6 +10,8 @@ import (
 	"log/slog"
 	"sync"
 	"time"
+
+	"nvpair-shared/noderec"
 )
 
 // modelsTimeout bounds the whole engine:models sweep so one hung engine can't
@@ -42,6 +44,11 @@ type ModelsResult struct {
 	Models         []string            `json:"models"`
 	ByEngine       map[string][]string `json:"modelsByEngine,omitempty"`
 	LoadedByEngine map[string][]string `json:"loadedByEngine,omitempty"`
+	// RoutingByEngine carries each engine's declarative routing metadata
+	// (capabilities, aliases, capacity, priority, timeouts) for the proxies'
+	// control plane. It is static manifest-derived data, independent of which
+	// engines are currently running.
+	RoutingByEngine map[string]*noderec.EngineRouting `json:"routingByEngine,omitempty"`
 }
 
 // Models returns the union of model names served by every installed, running
@@ -131,6 +138,18 @@ func (e *Executor) ModelsResult(ctx context.Context) ModelsResult {
 
 	res := ModelsResult{Models: []string{}}
 	seen := map[string]bool{}
+	// Publish declarative routing metadata from the manifests (static, not
+	// tied to liveness) so peers' proxies can gate and rank candidates.
+	for _, name := range e.reg.Names() {
+		if m, ok := e.reg.Get(name); ok {
+			if r := buildRouting(m); r != nil {
+				if res.RoutingByEngine == nil {
+					res.RoutingByEngine = make(map[string]*noderec.EngineRouting)
+				}
+				res.RoutingByEngine[name] = r
+			}
+		}
+	}
 	for i, models := range perEngine {
 		if listOK[i] {
 			if res.ByEngine == nil {
@@ -163,6 +182,54 @@ func (e *Executor) ModelsResult(ctx context.Context) ModelsResult {
 		}
 	}
 	return res
+}
+
+// buildRouting converts a manifest's declarative routing fields into the
+// shared wire type. It returns nil when the manifest declares none of them,
+// so an engine with no routing metadata contributes nothing (a consumer treats
+// a missing key as "no declared routing state").
+func buildRouting(m *Manifest) *noderec.EngineRouting {
+	has := m.APIFamily != "" || m.Model != nil || m.Capabilities != nil ||
+		m.Context != nil || m.Routing != nil || m.Timeouts != nil || m.HTTP != nil
+	if !has {
+		return nil
+	}
+	r := &noderec.EngineRouting{}
+	r.APIFamily = m.APIFamily
+	if m.Model != nil {
+		r.ModelRef = &noderec.EngineModelRef{
+			PhysicalName: m.Model.PhysicalName,
+			Aliases:      m.Model.Aliases,
+		}
+	}
+	if m.Capabilities != nil {
+		r.Capabilities = &noderec.EngineCaps{
+			Text:      m.Capabilities.Text,
+			Vision:    m.Capabilities.Vision,
+			Tools:     m.Capabilities.Tools,
+			Streaming: m.Capabilities.Streaming,
+			Reasoning: m.Capabilities.Reasoning,
+		}
+	}
+	if m.Context != nil {
+		r.ContextMaxTokens = m.Context.MaxTokens
+	}
+	if m.Routing != nil {
+		r.Priority = m.Routing.Priority
+		r.StaticCapacity = m.Routing.StaticCapacity
+		r.Pool = m.Routing.Pool
+	}
+	if m.Timeouts != nil {
+		r.Timeouts = &noderec.EngineTimeouts{
+			ConnectMS:      m.Timeouts.ConnectMS,
+			ResponseHeaderMS: m.Timeouts.ResponseHeaderMS,
+			FirstByteMS:    m.Timeouts.FirstByteMS,
+		}
+	}
+	if m.HTTP != nil && len(m.HTTP.Headers) > 0 {
+		r.AuthHeadersPresent = true
+	}
+	return r
 }
 
 // extractStrings is the value-only wrapper used by focused extractor tests.

@@ -10,7 +10,11 @@
  * reads its `--list-models` inventory.
  */
 
-export type DispatcherBackend = 'ollama' | 'lmstudio'
+// Open backend set: the two built-in backends are the known values, but a
+// heterogeneous fleet may dispatch to any backend name (vLLM, torch, a custom
+// runtime). `(string & {})` keeps autocomplete for the known values while
+// accepting arbitrary backend strings.
+export type DispatcherBackend = 'ollama' | 'lmstudio' | (string & {})
 
 /** One entry from the binary's `--list-models` JSON inventory. */
 export interface DispatcherModel {

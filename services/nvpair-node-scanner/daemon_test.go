@@ -41,11 +41,12 @@ func newSelfTestDaemon(hostUUID, ip string) *daemon {
 		dir:                newDirectory(),
 		http:               &http.Client{Timeout: nodeInfoFetchTimeout},
 		modelsHTTP:         &http.Client{Timeout: modelsFetchTimeout},
-		lastInfo:           make(map[string]NodeInfoResponse),
-		lastInfoAt:         make(map[string]time.Time),
-		lastModels:         make(map[string][]string),
+		lastInfo:            make(map[string]NodeInfoResponse),
+		lastInfoAt:          make(map[string]time.Time),
+		lastModels:          make(map[string][]string),
 		lastModelsByEngine: make(map[string]map[string][]string),
 		lastLoadedByEngine: make(map[string]map[string][]string),
+		lastRoutingByEngine: make(map[string]map[string]*noderec.EngineRouting),
 	}
 }
 
@@ -62,11 +63,12 @@ func TestReloadIdentityAdoptsClusterPrincipal(t *testing.T) {
 		reg:                newRegistry("scanner-minted-X", "", selfAddrs("127.0.0.1")),
 		dir:                newDirectory(),
 		baseDir:            base,
-		lastInfo:           make(map[string]NodeInfoResponse),
-		lastInfoAt:         make(map[string]time.Time),
-		lastModels:         make(map[string][]string),
+		lastInfo:            make(map[string]NodeInfoResponse),
+		lastInfoAt:          make(map[string]time.Time),
+		lastModels:          make(map[string][]string),
 		lastModelsByEngine: make(map[string]map[string][]string),
 		lastLoadedByEngine: make(map[string]map[string][]string),
+		lastRoutingByEngine: make(map[string]map[string]*noderec.EngineRouting),
 		// codec/responder nil: emit is nil-safe; reloadIdentity skips re-advertise.
 	}
 	// Simulate this node already having been browsed under its scanner-minted uuid.

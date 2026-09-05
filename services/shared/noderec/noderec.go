@@ -514,7 +514,13 @@ type DirectoryNode struct {
 	// empty list means "running, nothing loaded"; a missing key means the peer
 	// didn't report loaded state for it. Omitted when the peer reports none.
 	LoadedByEngine map[string][]string `json:"loadedByEngine,omitempty"`
-	LastSeen       int64               `json:"lastSeen"` // Unix seconds
+	// RoutingByEngine carries each engine's declarative routing metadata
+	// (capabilities, model aliases, capacity, priority, timeouts). Enriched
+	// from engine-manager's em /v1/models routingByEngine field. It is the
+	// control-plane input the proxies read on the inference hot path, so a
+	// missing key means the peer didn't report routing state for that engine.
+	RoutingByEngine map[string]*EngineRouting `json:"routingByEngine,omitempty"`
+	LastSeen        int64                     `json:"lastSeen"` // Unix seconds
 }
 
 // Clustered reports whether the node advertises a cluster identity.
@@ -575,6 +581,62 @@ func (n DirectoryNode) EngineModels(engine string) []string {
 		return n.ModelsByEngine[engine]
 	}
 	return n.Models
+}
+
+// EngineRouting is the declarative routing metadata a node's engine manager
+// publishes at /v1/models and that the discovery directory enriches onto
+// each DirectoryNode. It carries only operational characteristics (capabilities,
+// model aliases, capacity, priority, timeouts) — never prompt/response content
+// or credentials. Credentials stay local to the node and are not carried here.
+type EngineRouting struct {
+	APIFamily string `json:"api_family,omitempty"`
+	// Capabilities are the eligibility flags. A nil (undeclared) flag means
+	// "not declared" and is treated as unsupported for gating.
+	Capabilities *EngineCaps `json:"capabilities,omitempty"`
+	// ModelRef names the physical upstream model and its logical aliases.
+	ModelRef *EngineModelRef `json:"model_ref,omitempty"`
+	// ContextMaxTokens is the engine's maximum context in tokens.
+	ContextMaxTokens int `json:"context_max_tokens,omitempty"`
+	// Priority is the deterministic baseline preference (lower = preferred).
+	Priority int `json:"priority,omitempty"`
+	// StaticCapacity is the operator admission limit (max concurrent requests).
+	StaticCapacity int `json:"static_capacity,omitempty"`
+	// Pool is an optional workload tag.
+	Pool string `json:"pool,omitempty"`
+	// Timeouts are per-endpoint HTTP timeout characteristics (ms).
+	Timeouts *EngineTimeouts `json:"timeouts,omitempty"`
+	// AuthHeadersPresent is a presence flag only (never the values), so a
+	// consumer knows the endpoint needs auth without the secret crossing
+	// the trust boundary.
+	AuthHeadersPresent bool `json:"auth_headers_present,omitempty"`
+	// Enabled is the operator admission switch for this endpoint. It defaults
+	// to true when omitted (a missing key means "enabled").
+	Enabled bool `json:"enabled"`
+	// Draining marks an endpoint that should stop receiving NEW requests while
+	// in-flight ones finish. Omitted means false.
+	Draining bool `json:"draining,omitempty"`
+}
+
+// EngineCaps mirrors the manifest capability flags.
+type EngineCaps struct {
+	Text      *bool `json:"text,omitempty"`
+	Vision    *bool `json:"vision,omitempty"`
+	Tools     *bool `json:"tools,omitempty"`
+	Streaming *bool `json:"streaming,omitempty"`
+	Reasoning *bool `json:"reasoning,omitempty"`
+}
+
+// EngineModelRef is the physical model name plus logical aliases.
+type EngineModelRef struct {
+	PhysicalName string   `json:"physical_name,omitempty"`
+	Aliases      []string `json:"aliases,omitempty"`
+}
+
+// EngineTimeouts are per-endpoint timeout characteristics in milliseconds.
+type EngineTimeouts struct {
+	ConnectMS      int `json:"connect_ms,omitempty"`
+	ResponseHeaderMS int `json:"response_header_ms,omitempty"`
+	FirstByteMS    int `json:"first_byte_ms,omitempty"`
 }
 
 // SubscribeParams filters a subscription to nodes advertising any of the listed

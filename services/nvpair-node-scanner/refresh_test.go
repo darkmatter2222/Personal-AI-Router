@@ -94,11 +94,12 @@ func newRefreshTestDaemon() *daemon {
 		reg:                newRegistry("self-node-uuid", "", selfAddrs("127.0.0.1")),
 		dir:                newDirectory(),
 		modelsHTTP:         &http.Client{Timeout: modelsFetchTimeout},
-		lastInfo:           make(map[string]NodeInfoResponse),
-		lastInfoAt:         make(map[string]time.Time),
-		lastModels:         make(map[string][]string),
+		lastInfo:            make(map[string]NodeInfoResponse),
+		lastInfoAt:          make(map[string]time.Time),
+		lastModels:          make(map[string][]string),
 		lastModelsByEngine: make(map[string]map[string][]string),
 		lastLoadedByEngine: make(map[string]map[string][]string),
+		lastRoutingByEngine: make(map[string]map[string]*noderec.EngineRouting),
 	}
 }
 
@@ -445,7 +446,7 @@ func TestApplyModelsGuard(t *testing.T) {
 	d := newDirectory()
 
 	// Removed mid-sweep: node absent -> not resurrected.
-	if _, changed, ok := d.applyModels("ghost", "127.0.0.1", 14322, []string{"a"}, nil, nil); ok || changed {
+	if _, changed, ok := d.applyModels("ghost", "127.0.0.1", 14322, []string{"a"}, nil, nil, nil); ok || changed {
 		t.Errorf("applyModels on an absent node = (changed %v, ok %v), want (false, false)", changed, ok)
 	}
 	if _, present := d.get("ghost"); present {
@@ -459,11 +460,11 @@ func TestApplyModelsGuard(t *testing.T) {
 		Services: map[noderec.ServiceKey]noderec.ServiceStatus{noderec.ServiceEngineManager: {Port: 14322}},
 		Models:   []string{"old"},
 	})
-	if _, changed, ok := d.applyModels("peer-E", "127.0.0.1", 14322, []string{"new"}, nil, nil); ok || changed {
+	if _, changed, ok := d.applyModels("peer-E", "127.0.0.1", 14322, []string{"new"}, nil, nil, nil); ok || changed {
 		t.Errorf("applyModels with a stale IP = (changed %v, ok %v), want (false, false)", changed, ok)
 	}
 	// em port changed -> also discarded.
-	if _, changed, ok := d.applyModels("peer-E", "10.0.0.9", 99999, []string{"new"}, nil, nil); ok || changed {
+	if _, changed, ok := d.applyModels("peer-E", "10.0.0.9", 99999, []string{"new"}, nil, nil, nil); ok || changed {
 		t.Errorf("applyModels with a stale em port = (changed %v, ok %v), want (false, false)", changed, ok)
 	}
 	got, _ := d.get("peer-E")

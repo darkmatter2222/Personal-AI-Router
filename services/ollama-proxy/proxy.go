@@ -35,6 +35,7 @@ import (
 	"nvpair-shared/nodeactivity"
 	"nvpair-shared/noderec"
 	"nvpair-shared/reach"
+	"nvpair-shared/routing"
 	"nvpair-shared/schedulerwire"
 	"nvpair-shared/splitlisten"
 )
@@ -399,16 +400,44 @@ type Proxy struct {
 	// from 1 — without it, two concurrent cross-engine jobs, or a reused id
 	// after a restart, would collide in the broker's store.
 	runID string
+
+	// capacityMu guards capacityPools: the per-node static admission limits the
+	// capability-aware router reserves on selection and releases on every
+	// termination path (completion, error, cancel, timeout, failover).
+	capacityMu     sync.Mutex
+	capacityPools  map[string]*routing.Pool
+
+	// authMu guards authHeaders: the per-engine auth headers resolved locally
+	// (env-expanded) for engine HTTP actions. The values stay local to this
+	// node and are never advertised, logged, or included in diagnostics.
+	authMu      sync.Mutex
+	authHeaders map[string]map[string]string
+
+	// endpointMu guards endpointState: per-node lifecycle/health facet
+	// (healthy, enabled, draining) maintained asynchronously so the routing
+	// hot path reads pre-computed state rather than probing.
+	endpointMu    sync.RWMutex
+	endpointState map[string]endpointState
+}
+
+// endpointState is one node's async-maintained lifecycle/health facet.
+type endpointState struct {
+	Healthy  bool
+	Enabled  bool
+	Draining bool
 }
 
 func NewProxy(codec *Codec, discovery *Discovery, port int) *Proxy {
 	return &Proxy{
-		codec:     codec,
-		discovery: discovery,
-		port:      port,
-		targets:   reach.NewChooser(),
-		runID:     newRunID(),
-		activity:  nodeactivity.NewReporter(activityReportInterval),
+		codec:         codec,
+		discovery:     discovery,
+		port:          port,
+		targets:       reach.NewChooser(),
+		runID:         newRunID(),
+		activity:      nodeactivity.NewReporter(activityReportInterval),
+		capacityPools: make(map[string]*routing.Pool),
+		authHeaders:   make(map[string]map[string]string),
+		endpointState: make(map[string]endpointState),
 	}
 }
 
@@ -854,6 +883,19 @@ type candidate struct {
 	id       string
 	url      *url.URL
 	peerUUID string
+	// routing carries this node's declarative routing metadata for the engine
+	// this proxy fronts (capabilities, aliases, capacity, priority, timeouts,
+	// auth presence). Nil when the node declared none.
+	routing *noderec.EngineRouting
+}
+
+// routingForNode returns the node's routing metadata for the engine this proxy
+// fronts (workloadEngine), or nil when the node declared none.
+func routingForNode(n Node) *noderec.EngineRouting {
+	if n.Routing == nil {
+		return nil
+	}
+	return n.Routing[workloadEngine]
 }
 
 // candidateTransport returns the reverse-proxy / model-list transport for a
@@ -1147,7 +1189,18 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		routingModel = model
 	}
 	candidates := p.resolveCandidates(routingModel)
+	// capPool is the static-capacity slot held for the endpoint routeInference
+	// reserved; reservedNodeID names that endpoint. Both are swapped on
+	// failover and released on every terminal path so the admission limit is
+	// held only while a request is in flight.
+	var (
+		capPool        *routing.Pool
+		reservedNodeID string
+	)
 	if isInf && model != "" {
+		var out routing.Outcome
+		candidates, out, capPool = p.routeInference(candidates, bodyBytes)
+		reservedNodeID = out.SelectedID
 		candidates = p.reserveCandidate(candidates)
 	}
 	if r.Method == http.MethodGet && (r.URL.Path == "/api/tags" || r.URL.Path == "/v1/models") {
@@ -1319,7 +1372,15 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		cand := candidates[i]
 		last := i == len(candidates)-1
 		if bodyBytes != nil {
-			r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+			// Map the client's logical model name to this endpoint's physical
+			// model (or a declared alias) so one stable client-facing name can
+			// reach different physical model IDs on different runtimes. A node
+			// that declares no model mapping forwards the body unchanged.
+			candBody := bodyBytes
+			if model != "" {
+				candBody = rewriteModelAlias(bodyBytes, cand.routing, model)
+			}
+			r.Body = io.NopCloser(bytes.NewReader(candBody))
 		}
 		retry := false
 		sc := &statusCapture{ResponseWriter: w, status: http.StatusOK, idle: idleClientWriteTimeout}
@@ -1329,6 +1390,12 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 				req.URL.Scheme = cand.url.Scheme
 				req.URL.Host = cand.url.Host
 				req.Host = cand.url.Host
+				// Apply the endpoint's locally-resolved auth headers (e.g. Authorization)
+				// so a credential-requiring endpoint still receives them. Values are
+				// local to this node and are never logged or advertised.
+				if headers := p.authHeadersForCand(cand); len(headers) > 0 {
+					applyAuthHeaders(req, headers)
+				}
 			},
 			// A remote cluster peer is dialed over mTLS (per-peer pinned config);
 			// self/manual candidates use the plain transport. See candidateTransport.
@@ -1341,6 +1408,13 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 					// Abort before streaming: ReverseProxy closes resp.Body and
 					// calls ErrorHandler with our sentinel, then we try next.
 					retry = true
+					// Free the losing endpoint's static-capacity slot so the next
+					// (winning) endpoint can take it; the commit point re-reserves.
+					if cand.id == reservedNodeID && capPool != nil {
+						capPool.Release()
+						capPool = nil
+						reservedNodeID = ""
+					}
 					return retrySignal{}
 				}
 				// Prefer an engine-declared preflight policy so an exact origin plus
@@ -1379,6 +1453,21 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 						Path:   r.URL.Path,
 						Target: cand.url.Host,
 					})
+					// Static-capacity accounting: if failover landed on a different
+					// endpoint than the one routeInference reserved, release the old
+					// endpoint's slot and take a slot on the endpoint that actually
+					// serves the request. capPool/reservedNodeID are shared local
+					// state captured by both the status-retry and transport-error
+					// failover paths, which release the losing endpoint's slot before
+					// this point runs for the winner.
+					if cand.id != reservedNodeID {
+						if capPool != nil {
+							capPool.Release()
+						}
+						capPool = p.ensurePool(cand.id, staticCapacity(cand.routing))
+						capPool.Reserve()
+						reservedNodeID = cand.id
+					}
 					// workload:started was already emitted up front naming the
 					// first candidate. If failover landed us on a different
 					// node, re-point scheduledOn so the card — and the terminal
@@ -1414,6 +1503,14 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 					// Transport/dial error with candidates left: fail over.
 					retry = true
 					proxyErr = err.Error()
+					// Free the losing endpoint's static-capacity slot so the next
+					// endpoint can take it; the commit point re-reserves for the
+					// winner.
+					if cand.id == reservedNodeID && capPool != nil {
+						capPool.Release()
+						capPool = nil
+						reservedNodeID = ""
+					}
 					slog.Warn("proxy upstream error, failing over",
 						"id", reqID, "node_id", cand.id, "target", cand.url.Host,
 						"path", r.URL.Path, "err", err)
@@ -1509,6 +1606,15 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		default:
 			emitTerminal("completed", "")
 		}
+	}
+	// Release the static-capacity slot held for the endpoint serving this
+	// request now that it reached a terminal state (completed or failed). The
+	// slot is held for the whole request lifetime, including while the response
+	// streams. A failover has already moved the reservation to the winner, so
+	// capPool always points at the endpoint that actually served (or last
+	// attempted) the request.
+	if capPool != nil {
+		capPool.Release()
 	}
 }
 
@@ -1636,6 +1742,7 @@ func (p *Proxy) resolveCandidates(model string) []candidate {
 			id:       n.ID,
 			url:      u,
 			peerUUID: peerUUID,
+			routing:  routingForNode(n),
 		})
 	}
 
@@ -2110,6 +2217,10 @@ func subscribedToNode(n noderec.DirectoryNode) (Node, bool) {
 		// accepted as an Ollama owner here (falls back to the union for a peer
 		// that sends no attribution — see DirectoryNode.EngineModels).
 		Models: append([]string(nil), n.EngineModels("ollama")...),
+		// Project the node's declarative routing metadata (capabilities, aliases,
+		// capacity, priority, timeouts) so the capability-aware router can gate and
+		// rank candidates on the inference hot path.
+		Routing: n.RoutingByEngine,
 	}, true
 }
 

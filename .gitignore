@@ -22,3 +22,7 @@ __pycache__/
 
 # Per-machine bookkeeping written by the Cursor agent hooks, not configuration.
 /.cursor/hooks/state/
+
+# OpenCode per-machine goal/work-log state (goal-locks, goals/<id>.json).
+# Tooling state, not source; must not be committed into the tree that reaches GitHub.
+/.opencode/

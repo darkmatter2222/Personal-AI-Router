@@ -25,9 +25,10 @@ func newMembershipTestDaemon(clusterDir string) *daemon {
 		dir:                newDirectory(),
 		lastInfo:           make(map[string]NodeInfoResponse),
 		lastInfoAt:         make(map[string]time.Time),
-		lastModels:         make(map[string][]string),
+		lastModels:          make(map[string][]string),
 		lastModelsByEngine: make(map[string]map[string][]string),
 		lastLoadedByEngine: make(map[string]map[string][]string),
+		lastRoutingByEngine: make(map[string]map[string]*noderec.EngineRouting),
 		// codec/responder nil: emit is nil-safe; reloadIdentity skips re-advertise.
 	}
 }

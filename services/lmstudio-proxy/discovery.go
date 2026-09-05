@@ -15,11 +15,13 @@ package main
 // proxy.go.
 
 import (
+	"reflect"
 	"slices"
 	"sync"
 
 	"nvpair-shared/discovery"
 	"nvpair-shared/netpick"
+	"nvpair-shared/noderec"
 )
 
 // uuidFromTXT extracts a node's stable uuid= from its TXT records. Kept as a
@@ -55,6 +57,12 @@ type Node struct {
 	// removed. Internal routing metadata, not part of the proxy's outward node
 	// contract.
 	ClusterUUID string `json:"-"`
+	// Routing carries the node's declarative per-engine routing metadata
+	// (capabilities, model aliases, capacity, priority, timeouts, auth-header
+	// presence) for the engine this proxy fronts. It is projected from the
+	// discovery DirectoryNode.RoutingByEngine and is the control-plane input the
+	// capability-aware router reads on the inference hot path.
+	Routing map[string]*noderec.EngineRouting `json:"routing,omitempty"`
 }
 
 // withPrimaryIP returns a copy of the node with IP resolved by the shared ranker
@@ -136,7 +144,35 @@ func (d *Discovery) SetSubscribed(nodes []Node) (discovered, updated, removed []
 func nodeEqual(a, b Node) bool {
 	return a.ID == b.ID && a.Host == b.Host && a.Port == b.Port && a.IP == b.IP &&
 		slices.Equal(a.Addresses, b.Addresses) && slices.Equal(a.TXT, b.TXT) &&
-		slices.Equal(a.Models, b.Models)
+		slices.Equal(a.Models, b.Models) && routingMapsEqual(a.Routing, b.Routing)
+}
+
+// routingMapsEqual reports whether two per-engine routing-metadata maps are
+// deeply equal. A nil and an empty map compare equal (both mean "no declared
+// routing state").
+func routingMapsEqual(a, b map[string]*noderec.EngineRouting) bool {
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return len(a) == 0 && len(b) == 0
+	}
+	if len(a) != len(b) {
+		return false
+	}
+	for k, av := range a {
+		bv, ok := b[k]
+		if !ok {
+			return false
+		}
+		if av == nil && bv == nil {
+			continue
+		}
+		if av == nil || bv == nil || !reflect.DeepEqual(av, bv) {
+			return false
+		}
+	}
+	return true
 }
 
 func (d *Discovery) AddManual(node Node) (added bool) {

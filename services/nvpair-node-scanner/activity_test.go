@@ -155,6 +155,7 @@ func TestForgetClearsActivity(t *testing.T) {
 	d.lastModels = make(map[string][]string)
 	d.lastModelsByEngine = make(map[string]map[string][]string)
 	d.lastLoadedByEngine = make(map[string]map[string][]string)
+	d.lastRoutingByEngine = make(map[string]map[string]*noderec.EngineRouting)
 	d.nodeInfoDown = make(map[string]bool)
 
 	d.noteActivity("node", 0)

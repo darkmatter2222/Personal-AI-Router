@@ -12,9 +12,42 @@ import (
 	"nvpair-shared/schedulerwire"
 )
 
-// schedulerEngines is the fixed set of engine-specific output contracts. Both
-// receive the same node-wide ranking because their work shares node resources.
+// schedulerEngines is the built-in default set of engine output contracts. It is
+// NOT closed: activeEngines() unions it with any engine name that appears in the
+// workload catalog, so a heterogeneous fleet (vLLM, torch, custom runtimes) is
+// scheduled without hard-coding each new engine here. Both the defaults and the
+// catalog-derived engines receive the same node-wide ranking because their work
+// shares node resources.
 var schedulerEngines = []string{"ollama", "lmstudio"}
+
+// activeEngines returns the engine set to emit priorities for: the built-in
+// defaults plus any engine with at least one workload in the catalog. This is
+// what "open" means — an unknown engine that a proxy reports a workload for is
+// scheduled on first sight, no code change needed.
+func (m *Manager) activeEngines() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.activeEnginesLocked()
+}
+
+// activeEnginesLocked assumes the caller holds m.mu and returns the same set.
+func (m *Manager) activeEnginesLocked() []string {
+	seen := make(map[string]bool, len(schedulerEngines))
+	for _, e := range schedulerEngines {
+		seen[e] = true
+	}
+	for _, w := range m.catalog {
+		if w.Engine != "" {
+			seen[w.Engine] = true
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for e := range seen {
+		out = append(out, e)
+	}
+	sort.Strings(out)
+	return out
+}
 
 // NodeRank is retained as the scheduler's public status type while the wire
 // definition is shared with the broker and proxies.
@@ -66,7 +99,7 @@ func (m *Manager) recomputeAll(force bool) {
 	defer m.recomputeMu.Unlock()
 
 	order, ranks := m.rank()
-	for _, e := range schedulerEngines {
+	for _, e := range m.activeEngines() {
 		m.emitIfChanged(e, order, ranks, force)
 	}
 }
@@ -155,8 +188,12 @@ func (m *Manager) emitIfChanged(engine string, order []string, ranks []NodeRank,
 func (m *Manager) status() statusResult {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	engines := make(map[string]EngineSchedule, len(schedulerEngines))
-	for _, e := range schedulerEngines {
+	// Derive the engine set live from state so a newly-seen engine (vLLM, torch,
+	// a custom runtime) appears in get-status without a code change. status()
+	// already holds m.mu, so use the locked variant.
+	active := m.activeEnginesLocked()
+	engines := make(map[string]EngineSchedule, len(active))
+	for _, e := range active {
 		st := m.emitted[e]
 		emitted := st.ranks
 		if emitted == nil {

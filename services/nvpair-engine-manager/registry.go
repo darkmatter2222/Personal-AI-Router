@@ -55,6 +55,96 @@ type Manifest struct {
 	ManifestVersion int                 `json:"manifest_version"`
 	Platforms       map[string]Platform `json:"platforms"`
 	Actions         map[string]Action   `json:"actions,omitempty"`
+	// APIFamily names the wire protocol the engine speaks to PAIR ("openai",
+	// "ollama", ...). It drives which proxy frontends and request shapes apply.
+	APIFamily string `json:"api_family,omitempty"`
+	// Lifecycle declares whether PAIR owns the engine's process lifecycle.
+	Lifecycle *LifecycleSpec `json:"lifecycle,omitempty"`
+	// Model is the engine's served-model declaration: the physical upstream
+	// model name plus the client-facing logical aliases.
+	Model *ManifestModel `json:"model,omitempty"`
+	// Capabilities are the declarative capability flags the routing layer
+	// uses as eligibility constraints (text, vision, tools, streaming,
+	// reasoning).
+	Capabilities *EngineCapabilities `json:"capabilities,omitempty"`
+	// Context declares the engine/model maximum context in tokens.
+	Context *ManifestContext `json:"context,omitempty"`
+	// Routing declares operator routing policy: deterministic priority
+	// (lower = preferred) and static admission capacity.
+	Routing *ManifestRouting `json:"routing,omitempty"`
+	// Timeouts are the per-endpoint HTTP timeout characteristics. They let a
+	// slow cold-start endpoint (long first-byte budget) coexist with fast
+	// endpoints that keep a short failure-detection budget, without a global
+	// timeout increase.
+	Timeouts *ManifestTimeouts `json:"timeouts,omitempty"`
+	// HTTP carries per-action headers (e.g. Authorization). Header values may
+	// reference environment secrets via ${VAR}; the secret itself never leaves
+	// the node.
+	HTTP *ManifestHTTP `json:"http,omitempty"`
+}
+
+// LifecycleSpec declares how PAIR may manage the engine process.
+//   - "managed" (default): PAIR installs, starts, stops, loads/unloads.
+//   - "external" (adopt-only): PAIR observes and routes; it never installs,
+//     starts, stops, unloads, or reconfigures the engine's process.
+type LifecycleSpec struct {
+	Mode string `json:"mode"` // "managed" | "external"
+}
+
+// ManifestModel is the served-model declaration: the physical upstream model
+// identifier plus any client-facing logical aliases. Aliases are explicit
+// configuration — PAIR never infers equivalence from similar-looking names.
+type ManifestModel struct {
+	// PhysicalName is the upstream model identifier the engine serves.
+	PhysicalName string `json:"physical_name"`
+	// Aliases are the stable client-facing logical names that map to
+	// PhysicalName on this engine.
+	Aliases []string `json:"aliases,omitempty"`
+}
+
+// EngineCapabilities are the declarative capability flags. Omitted flags
+// (nil) mean "not declared" and are treated as unsupported for gating,
+// so a request requiring an undeclared capability is not routed here.
+type EngineCapabilities struct {
+	Text      *bool `json:"text,omitempty"`
+	Vision    *bool `json:"vision,omitempty"`
+	Tools     *bool `json:"tools,omitempty"`
+	Streaming *bool `json:"streaming,omitempty"`
+	Reasoning *bool `json:"reasoning,omitempty"`
+}
+
+// ManifestContext declares the maximum context (in tokens) the engine/model
+// deployment can serve.
+type ManifestContext struct {
+	MaxTokens int `json:"max_tokens"`
+}
+
+// ManifestRouting declares operator routing policy for the engine.
+type ManifestRouting struct {
+	// Priority is the deterministic baseline preference; lower values are
+	// preferred. Used only when the routing strategy is deterministic.
+	Priority int `json:"priority,omitempty"`
+	// StaticCapacity is the maximum number of concurrent admitted requests
+	// (operator admission policy, not the runtime's theoretical limit).
+	StaticCapacity int `json:"static_capacity,omitempty"`
+	// Pool is an optional workload tag grouping compatible endpoints.
+	Pool string `json:"pool,omitempty"`
+}
+
+// ManifestTimeouts are per-endpoint timeout characteristics in milliseconds.
+// Zero means "use the proxy's default budget".
+type ManifestTimeouts struct {
+	ConnectMS        int `json:"connect_ms,omitempty"`
+	ResponseHeaderMS  int `json:"response_header_ms,omitempty"`
+	FirstByteMS       int `json:"first_byte_ms,omitempty"`
+}
+
+// ManifestHTTP carries optional headers sent on the engine's HTTP actions
+// (auth, etc.). Values may reference environment secrets as ${VAR}; the
+// resolved secret stays local to the node and is never advertised, logged,
+// or included in diagnostics.
+type ManifestHTTP struct {
+	Headers map[string]string `json:"headers"`
 }
 
 // Platform is the per-`<goos>/<goarch>` block. Variance lives here
@@ -545,7 +635,47 @@ func (m *Manifest) Validate() error {
 			return err
 		}
 	}
-	for name, a := range m.Actions {
+		if m.Lifecycle != nil {
+			switch m.Lifecycle.Mode {
+			case "", "managed", "external":
+			default:
+				return fmt.Errorf("lifecycle.mode %q invalid (want \"managed\" or \"external\")", m.Lifecycle.Mode)
+			}
+		}
+		if m.Model != nil {
+			if strings.TrimSpace(m.Model.PhysicalName) == "" {
+				return errors.New("model.physical_name is required when model is set")
+			}
+			for _, al := range m.Model.Aliases {
+				if strings.TrimSpace(al) == "" || al == m.Model.PhysicalName {
+					return errors.New("model.aliases must be nonempty and differ from the physical name")
+				}
+			}
+		}
+		if m.Context != nil && m.Context.MaxTokens <= 0 {
+			return errors.New("context.max_tokens must be positive when context is set")
+		}
+		if m.Routing != nil {
+			if m.Routing.StaticCapacity < 0 {
+				return errors.New("routing.static_capacity must be >= 0")
+			}
+		}
+		if m.Timeouts != nil {
+			if m.Timeouts.ConnectMS < 0 || m.Timeouts.ResponseHeaderMS < 0 || m.Timeouts.FirstByteMS < 0 {
+				return errors.New("timeouts must be non-negative milliseconds")
+			}
+		}
+		if m.HTTP != nil {
+			for k, v := range m.HTTP.Headers {
+				if strings.TrimSpace(k) == "" {
+					return errors.New("http.headers must have nonempty header names")
+				}
+				if strings.TrimSpace(v) == "" {
+					return errors.New("http.headers values must be nonempty")
+				}
+			}
+		}
+		for name, a := range m.Actions {
 		if err := a.validate(name); err != nil {
 			return err
 		}

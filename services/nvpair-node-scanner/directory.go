@@ -5,6 +5,7 @@ package main
 
 import (
 	"log/slog"
+	"reflect"
 	"sort"
 	"sync"
 	"time"
@@ -241,7 +242,7 @@ func (d *directory) snapshot(filter noderec.ServiceKey) []noderec.DirectoryNode 
 // Returns the (possibly updated) node, whether the inventory changed, and
 // whether the guarded apply was valid. ok == false means the result is stale
 // (node gone or re-addressed) and the caller must not cache or emit it.
-func (d *directory) applyModels(hostUUID, ip string, emPort int, models []string, byEngine, loadedByEngine map[string][]string) (node noderec.DirectoryNode, changed, ok bool) {
+func (d *directory) applyModels(hostUUID, ip string, emPort int, models []string, byEngine, loadedByEngine map[string][]string, routingByEngine map[string]*noderec.EngineRouting) (node noderec.DirectoryNode, changed, ok bool) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	n, present := d.nodes[hostUUID]
@@ -252,12 +253,13 @@ func (d *directory) applyModels(hostUUID, ip string, emPort int, models []string
 	if !has || n.IP != ip || em.Port != emPort {
 		return n, false, false
 	}
-	if sameStringSet(n.Models, models) && sameByEngine(n.ModelsByEngine, byEngine) && sameByEngine(n.LoadedByEngine, loadedByEngine) {
+	if sameStringSet(n.Models, models) && sameByEngine(n.ModelsByEngine, byEngine) && sameByEngine(n.LoadedByEngine, loadedByEngine) && sameRouting(n.RoutingByEngine, routingByEngine) {
 		return n, false, true
 	}
 	n.Models = models
 	n.ModelsByEngine = byEngine
 	n.LoadedByEngine = loadedByEngine
+	n.RoutingByEngine = routingByEngine
 	d.nodes[hostUUID] = n
 	return n, true, true
 }
@@ -318,6 +320,34 @@ func sameByEngine(a, b map[string][]string) bool {
 	for k, av := range a {
 		bv, ok := b[k]
 		if !ok || !sameStringSet(av, bv) {
+			return false
+		}
+	}
+	return true
+}
+
+// sameRouting reports whether two per-engine routing-metadata maps are deeply
+// equal. A nil and an empty map compare equal (both mean "no declared routing
+// state"); a present-but-nil value and an absent key are distinct.
+func sameRouting(a, b map[string]*noderec.EngineRouting) bool {
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return len(a) == 0 && len(b) == 0
+	}
+	if len(a) != len(b) {
+		return false
+	}
+	for k, av := range a {
+		bv, ok := b[k]
+		if !ok {
+			return false
+		}
+		if av == nil && bv == nil {
+			continue
+		}
+		if av == nil || bv == nil || !reflect.DeepEqual(av, bv) {
 			return false
 		}
 	}
