@@ -44,6 +44,12 @@ type Manager struct {
 	mu        sync.Mutex
 	interval  time.Duration
 	nodes     map[string]bool
+	// engines is the set of engine ids discovered in the cluster (the union of
+	// every node's modelsByEngine/routingByEngine keys). It is what makes the
+	// scheduler's engine set OPEN: priority is emitted for every discovered
+	// engine, not only the built-in baseline, so an arbitrary engine id with a
+	// live node is representable without a source-code enum entry.
+	engines   map[string]bool
 	catalog   map[wlKey]workload
 	telemetry map[string]gpuTelemetryState
 	emitted   map[string]engineState
@@ -68,6 +74,7 @@ func NewManager(codec *Codec, interval time.Duration) *Manager {
 		codec:     codec,
 		interval:  interval,
 		nodes:     make(map[string]bool),
+		engines:   make(map[string]bool),
 		catalog:   make(map[wlKey]workload),
 		telemetry: make(map[string]gpuTelemetryState),
 		emitted:   make(map[string]engineState),

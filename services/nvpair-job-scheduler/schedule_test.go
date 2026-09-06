@@ -652,6 +652,81 @@ func TestEmit_EmptyUniverseSilent(t *testing.T) {
 	}
 }
 
+// TestOpenEngineSet_DiscoveredEngineEmitsPriorityAndPrunes proves the scheduler
+// engine set is OPEN: an engine id that appears in no source enumeration, learned
+// only from a node's modelsByEngine / routingByEngine keys, receives its own
+// per-engine priority; the built-in baseline still emits; and a discovered engine
+// is pruned from status once it leaves the cluster.
+func TestOpenEngineSet_DiscoveredEngineEmitsPriorityAndPrunes(t *testing.T) {
+	rec := &capRW{}
+	m := NewManager(NewCodec(rec), 24*time.Hour)
+	// Two novel engine ids — neither exists anywhere in production source.
+	const viaModels = "engine-open-set-probe"
+	const viaRouting = "another-custom-engine"
+	m.handleMessage(&Message{
+		JSONRPC: "2.0",
+		Method:  "discovery:nodes-changed",
+		Params: json.RawMessage(`[
+			{"hostUuid":"a","modelsByEngine":{"` + viaModels + `":["m1"]}},
+			{"hostUuid":"b","routingByEngine":{"` + viaRouting + `":{}}}
+		]`),
+	})
+
+	if got := rec.orders(viaModels); len(got) == 0 {
+		t.Fatalf("engine discovered via modelsByEngine (%q) must receive priority", viaModels)
+	}
+	if got := rec.orders(viaRouting); len(got) == 0 {
+		t.Fatalf("engine discovered via routingByEngine (%q) must receive priority", viaRouting)
+	}
+	for _, e := range schedulerEngines {
+		if got := rec.orders(e); len(got) == 0 {
+			t.Fatalf("built-in baseline engine %q must still receive priority", e)
+		}
+	}
+	st := m.status()
+	for _, e := range []string{viaModels, viaRouting, "ollama", "lmstudio"} {
+		if _, ok := st.Engines[e]; !ok {
+			t.Fatalf("status missing discovered/baseline engine %q", e)
+		}
+	}
+
+	// The discovered engines leave the cluster; the baseline must survive, the
+	// unknown ones must be pruned from status.
+	m.handleMessage(&Message{
+		JSONRPC: "2.0",
+		Method:  "discovery:nodes-changed",
+		Params:  json.RawMessage(`[{"hostUuid":"a"}]`),
+	})
+	st2 := m.status()
+	if _, ok := st2.Engines[viaModels]; ok {
+		t.Fatalf("engine %q should be pruned from status after leaving discovery", viaModels)
+	}
+	if _, ok := st2.Engines[viaRouting]; ok {
+		t.Fatalf("engine %q should be pruned after leaving discovery", viaRouting)
+	}
+	if _, ok := st2.Engines["ollama"]; !ok {
+		t.Fatal("built-in baseline must survive pruning")
+	}
+}
+
+// TestApplyNodesChanged_EngineSetChangeReportsChanged: a node set that is
+// otherwise identical but advertises a new engine must report changed so the
+// scheduler recomputes and emits for the new engine.
+func TestApplyNodesChanged_EngineSetChangeReportsChanged(t *testing.T) {
+	m := NewManager(NewCodec(nopRW{}), time.Second)
+	if !m.applyNodesChanged(json.RawMessage(`[{"hostUuid":"a","modelsByEngine":{"ollama":["x"]}}]`)) {
+		t.Fatal("initial should report changed")
+	}
+	// Same node, new engine advertised -> changed.
+	if !m.applyNodesChanged(json.RawMessage(`[{"hostUuid":"a","modelsByEngine":{"ollama":["x"],"newengine":["y"]}}]`)) {
+		t.Fatal("adding an engine to an existing node should report changed")
+	}
+	// Identical -> no change.
+	if m.applyNodesChanged(json.RawMessage(`[{"hostUuid":"a","modelsByEngine":{"newengine":["y"],"ollama":["x"]}}]`)) {
+		t.Fatal("identical node+engine set (reordered) should be a no-op")
+	}
+}
+
 // TestSetInterval_Floor: a sub-floor interval is clamped to 200ms.
 func TestSetInterval_Floor(t *testing.T) {
 	rec := &capRW{}

@@ -38,6 +38,13 @@ type removeParams struct {
 type availableNode struct {
 	ID       string `json:"id"`
 	HostUUID string `json:"hostUuid"`
+	// ModelsByEngine / RoutingByEngine are decoded only for their KEYS: the set
+	// of engine ids a node advertises. The scheduler ranks node-wide (engine
+	// values are irrelevant to the ranking), so the values are left as raw
+	// messages and never inspected — this keeps the scheduler decoupled from the
+	// model/routing value shapes while still learning which engines exist.
+	ModelsByEngine  map[string]json.RawMessage `json:"modelsByEngine"`
+	RoutingByEngine map[string]json.RawMessage `json:"routingByEngine"`
 }
 
 // key is the node's operational identity: its hostUuid, matching the value
@@ -69,21 +76,33 @@ func (m *Manager) applyNodesChanged(params json.RawMessage) bool {
 		return false
 	}
 	set := make(map[string]bool, len(nodes))
+	engineSet := make(map[string]bool)
 	for _, n := range nodes {
 		if k := n.key(); k != "" {
 			set[k] = true
 		}
+		for e := range n.ModelsByEngine {
+			if e != "" {
+				engineSet[e] = true
+			}
+		}
+		for e := range n.RoutingByEngine {
+			if e != "" {
+				engineSet[e] = true
+			}
+		}
 	}
 	m.mu.Lock()
-	changed := !sameNodeSet(m.nodes, set)
+	changed := !sameNodeSet(m.nodes, set) || !sameNodeSet(m.engines, engineSet)
 	m.nodes = set
+	m.engines = engineSet
 	for hostUUID := range m.telemetry {
 		if !set[hostUUID] {
 			delete(m.telemetry, hostUUID)
 		}
 	}
 	m.mu.Unlock()
-	slog.Debug("node universe updated", "count", len(set))
+	slog.Debug("node universe updated", "count", len(set), "engines", len(engineSet))
 	return changed
 }
 

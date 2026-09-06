@@ -12,9 +12,58 @@ import (
 	"nvpair-shared/schedulerwire"
 )
 
-// schedulerEngines is the fixed set of engine-specific output contracts. Both
-// receive the same node-wide ranking because their work shares node resources.
+// schedulerEngines is the built-in BASELINE set of engine output contracts —
+// always emitted so existing ollama/lmstudio consumers keep receiving priority
+// even when momentarily no node advertises them. It is no longer the whole
+// universe: engineList unions it with the engines actually discovered in the
+// cluster (see Manager.engines), so an arbitrary engine id gets its own
+// per-engine ranking without a source-code entry here. Every engine receives
+// the same node-wide ranking because their work shares node resources.
 var schedulerEngines = []string{"ollama", "lmstudio"}
+
+// engineList returns the sorted union of the built-in baseline engines and the
+// engines currently discovered in the cluster. It is the open engine set the
+// scheduler emits priority for.
+func (m *Manager) engineList() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.engineListLocked()
+}
+
+// engineListLocked is engineList for callers already holding m.mu.
+func (m *Manager) engineListLocked() []string {
+	set := make(map[string]bool, len(m.engines)+len(schedulerEngines))
+	for _, e := range schedulerEngines {
+		set[e] = true
+	}
+	for e := range m.engines {
+		set[e] = true
+	}
+	out := make([]string, 0, len(set))
+	for e := range set {
+		out = append(out, e)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// pruneEmitted drops last-emitted snapshots for engines no longer in the current
+// set (a discovered engine that has left the cluster), so stale unknown engines
+// don't linger in status forever. Built-in baseline engines are always in the
+// current set and therefore never pruned.
+func (m *Manager) pruneEmitted(current []string) {
+	keep := make(map[string]bool, len(current))
+	for _, e := range current {
+		keep[e] = true
+	}
+	m.mu.Lock()
+	for e := range m.emitted {
+		if !keep[e] {
+			delete(m.emitted, e)
+		}
+	}
+	m.mu.Unlock()
+}
 
 // NodeRank is retained as the scheduler's public status type while the wire
 // definition is shared with the broker and proxies.
@@ -66,9 +115,11 @@ func (m *Manager) recomputeAll(force bool) {
 	defer m.recomputeMu.Unlock()
 
 	order, ranks := m.rank()
-	for _, e := range schedulerEngines {
+	engines := m.engineList()
+	for _, e := range engines {
 		m.emitIfChanged(e, order, ranks, force)
 	}
+	m.pruneEmitted(engines)
 }
 
 // rank computes the workload and GPU-pressure node-wide order (spec §7.2).
@@ -155,8 +206,9 @@ func (m *Manager) emitIfChanged(engine string, order []string, ranks []NodeRank,
 func (m *Manager) status() statusResult {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	engines := make(map[string]EngineSchedule, len(schedulerEngines))
-	for _, e := range schedulerEngines {
+	list := m.engineListLocked()
+	engines := make(map[string]EngineSchedule, len(list))
+	for _, e := range list {
 		st := m.emitted[e]
 		emitted := st.ranks
 		if emitted == nil {
