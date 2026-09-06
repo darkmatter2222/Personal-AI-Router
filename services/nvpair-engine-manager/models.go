@@ -10,6 +10,8 @@ import (
 	"log/slog"
 	"sync"
 	"time"
+
+	"nvpair-shared/routing"
 )
 
 // modelsTimeout bounds the whole engine:models sweep so one hung engine can't
@@ -42,6 +44,15 @@ type ModelsResult struct {
 	Models         []string            `json:"models"`
 	ByEngine       map[string][]string `json:"modelsByEngine,omitempty"`
 	LoadedByEngine map[string][]string `json:"loadedByEngine,omitempty"`
+	// RoutingByEngine is the declarative, credential-free routing metadata each
+	// engine's manifest declares (capabilities, context, model aliases, priority,
+	// capacity, timeouts, api family, lifecycle, enabled/draining). Unlike the
+	// model lists it is static config, so it is emitted for every engine whose
+	// manifest declares a routing block regardless of running state — this lets
+	// the control plane (scheduler open-set, capability routing) reason about an
+	// engine's contract even before it is up. It NEVER contains the manifest's
+	// Auth block: backend credentials are node-local and never cross this wire.
+	RoutingByEngine map[string]routing.EngineRouting `json:"routingByEngine,omitempty"`
 }
 
 // Models returns the union of model names served by every installed, running
@@ -161,6 +172,21 @@ func (e *Executor) ModelsResult(ctx context.Context) ModelsResult {
 			}
 			res.LoadedByEngine[engineNames[i]] = ld
 		}
+	}
+
+	// Routing metadata is static manifest config (not a per-sweep query), so it
+	// is attached here for every engine whose manifest declares a routing block —
+	// running or not. The manifest's Auth block is deliberately NOT copied: it is
+	// node-local and must never cross the /v1/models wire.
+	for _, name := range engineNames {
+		mf, ok := e.reg.Get(name)
+		if !ok || mf.Routing == nil {
+			continue
+		}
+		if res.RoutingByEngine == nil {
+			res.RoutingByEngine = make(map[string]routing.EngineRouting)
+		}
+		res.RoutingByEngine[name] = *mf.Routing
 	}
 	return res
 }

@@ -16,6 +16,8 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+
+	"nvpair-shared/routing"
 )
 
 // ManifestSchemaVersion is the highest manifest_version this binary
@@ -55,6 +57,20 @@ type Manifest struct {
 	ManifestVersion int                 `json:"manifest_version"`
 	Platforms       map[string]Platform `json:"platforms"`
 	Actions         map[string]Action   `json:"actions,omitempty"`
+	// Routing is the optional, additive capability-aware routing contract for
+	// this engine (api family, lifecycle mode, model aliases/capabilities,
+	// context, priority, capacity, timeouts, enabled/draining state). It is
+	// engine-agnostic and credential-free; it is propagated to the cluster on
+	// /v1/models -> DirectoryNode.RoutingByEngine. A manifest that omits it keeps
+	// PAIR's existing (legacy) routing behaviour for that engine, so the bundled
+	// ollama/lmstudio manifests are unaffected.
+	Routing *routing.EngineRouting `json:"routing,omitempty"`
+	// Auth is the optional NODE-LOCAL backend credential contract for this
+	// engine. It is resolved and applied only on this node when forwarding to the
+	// local backend (inference proxy) or running an HTTP action; it is
+	// deliberately NEVER included in /v1/models routing metadata, discovery, or
+	// any peer-facing payload, so a credential never leaves the node that owns it.
+	Auth *routing.LocalAuth `json:"auth,omitempty"`
 }
 
 // Platform is the per-`<goos>/<goarch>` block. Variance lives here
@@ -562,6 +578,16 @@ func (m *Manifest) Validate() error {
 					return fmt.Errorf("action %q: restart_after requires platform %q to declare runtime.ready (the restart is only observable once the engine is ready again)", name, key)
 				}
 			}
+		}
+	}
+	if m.Routing != nil {
+		if err := m.Routing.Validate(); err != nil {
+			return fmt.Errorf("routing: %w", err)
+		}
+	}
+	if m.Auth != nil {
+		if err := m.Auth.Validate(); err != nil {
+			return fmt.Errorf("auth: %w", err)
 		}
 	}
 	return m.validatePlaceholders()

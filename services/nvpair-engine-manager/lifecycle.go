@@ -18,6 +18,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"nvpair-shared/routing"
 )
 
 const (
@@ -84,6 +86,9 @@ func (e *Executor) Start(ctx context.Context, engine string) error {
 // StartWith is Start with per-call overrides. The overrides are not
 // persisted — a service restart reverts to the manifest.
 func (e *Executor) StartWith(ctx context.Context, engine string, opts startOpts) error {
+	if err := e.guardOp(engine, routing.OpStart); err != nil {
+		return err
+	}
 	st, err := e.state(engine)
 	if err != nil {
 		return err
@@ -352,6 +357,9 @@ func (e *Executor) watch(st *engineState, engine string, proc *managedProc) {
 // owned process (graceful then forced); in command mode it runs the
 // manifest's stop command. No-op if not running.
 func (e *Executor) Stop(engine string) error {
+	if err := e.guardOp(engine, routing.OpStop); err != nil {
+		return err
+	}
 	st, err := e.state(engine)
 	if err != nil {
 		return err
@@ -675,6 +683,9 @@ func (e *Executor) reconcileFailedCommandStop(st *engineState, engine string, ru
 // Restart stops then starts the engine, holding the op lock across both
 // so nothing can interleave between the stop and the start.
 func (e *Executor) Restart(ctx context.Context, engine string) error {
+	if err := e.guardOp(engine, routing.OpRestart); err != nil {
+		return err
+	}
 	st, err := e.state(engine)
 	if err != nil {
 		return err
@@ -709,6 +720,12 @@ func (e *Executor) StopAll() {
 	// Each engine still serializes on its own opMu, so this is safe.
 	var wg sync.WaitGroup
 	for _, n := range names {
+		// Never stop an external (adopt-only) engine, even on our own shutdown:
+		// PAIR does not own its process and it outlives us. Skip silently (this is
+		// shutdown, not an explicit user Stop, so it is not an error).
+		if e.externalEngine(n) {
+			continue
+		}
 		st, err := e.state(n)
 		if err != nil {
 			continue

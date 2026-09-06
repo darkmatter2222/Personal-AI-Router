@@ -17,11 +17,16 @@ import (
 	"path"
 	"strings"
 	"time"
+
+	"nvpair-shared/routing"
 )
 
 // Install obtains the engine in user mode: download (checksum-verified)
 // then run the declared command. No-op if already detected.
 func (e *Executor) Install(ctx context.Context, engine string) error {
+	if err := e.guardOp(engine, routing.OpInstall); err != nil {
+		return err
+	}
 	st, err := e.state(engine)
 	if err != nil {
 		return err
@@ -128,6 +133,9 @@ func (e *Executor) Install(ctx context.Context, engine string) error {
 // Uninstall runs the manifest's uninstall command (user-mode), stopping
 // the engine first. No-op if the engine isn't currently detected.
 func (e *Executor) Uninstall(ctx context.Context, engine string) error {
+	if err := e.guardOp(engine, routing.OpUninstall); err != nil {
+		return err
+	}
 	st, err := e.state(engine)
 	if err != nil {
 		return err
