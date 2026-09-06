@@ -78,7 +78,12 @@ func TestEngineHTTPClientsBoundResponseHeaders(t *testing.T) {
 	}
 }
 
-func TestOnlyOllamaRunModelUsesSlowResponseHeaderBudget(t *testing.T) {
+// TestSlowLoadActionUsesSlowResponseHeaderBudget verifies that the long
+// response-header budget is selected by an action's declared slow_load flag, not
+// by the engine brand: a slow_load action gets the generous client (and
+// succeeds despite a slow header), a non-slow_load action gets the ordinary
+// budget (and times out), and this holds for a non-ollama engine too.
+func TestSlowLoadActionUsesSlowResponseHeaderBudget(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		time.Sleep(100 * time.Millisecond)
 		w.Header().Set("Content-Type", "application/json")
@@ -94,7 +99,7 @@ func TestOnlyOllamaRunModelUsesSlowResponseHeaderBudget(t *testing.T) {
 	platform.Runtime.Port = port
 	m.Platforms[runtime.GOOS+"/"+runtime.GOARCH] = platform
 	m.Actions = map[string]Action{
-		"run_model":    {HTTP: &ActionHTTP{Method: "POST", Path: "/api/generate"}},
+		"run_model":    {HTTP: &ActionHTTP{Method: "POST", Path: "/api/generate"}, SlowLoad: true},
 		"delete_model": {HTTP: &ActionHTTP{Method: "DELETE", Path: "/api/delete"}},
 	}
 	ex := newTestExecutor(t, m)
@@ -106,20 +111,24 @@ func TestOnlyOllamaRunModelUsesSlowResponseHeaderBudget(t *testing.T) {
 	}
 	st.running = true
 
+	// A slow_load action gets the generous response-header budget and succeeds.
 	if _, err := ex.Action(context.Background(), "ollama", "run_model", json.RawMessage(`{"model":"tiny"}`)); err != nil {
-		t.Fatalf("Ollama load was cut off by the ordinary response-header budget: %v", err)
+		t.Fatalf("slow_load action was cut off by the ordinary response-header budget: %v", err)
 	}
+	// A non-slow_load action uses the ordinary budget and times out.
 	if _, err := ex.Action(context.Background(), "ollama", "delete_model", json.RawMessage(`{"name":"tiny"}`)); err == nil || !strings.Contains(err.Error(), "timeout awaiting response headers") {
 		t.Fatalf("ordinary action error = %v, want bounded response-header timeout", err)
 	}
 
+	// The slow budget is driven by the flag, not the engine brand: a non-ollama
+	// engine whose run_model declares slow_load also gets the generous budget.
 	other := testEngineManifest(fakeEngineBin)
 	other.Engine = "other"
 	otherPlatform := other.Platforms[runtime.GOOS+"/"+runtime.GOARCH]
 	otherPlatform.Runtime.Port = port
 	other.Platforms[runtime.GOOS+"/"+runtime.GOARCH] = otherPlatform
 	other.Actions = map[string]Action{
-		"run_model": {HTTP: &ActionHTTP{Method: "POST", Path: "/api/generate"}},
+		"run_model": {HTTP: &ActionHTTP{Method: "POST", Path: "/api/generate"}, SlowLoad: true},
 	}
 	otherEx := newTestExecutor(t, other)
 	otherEx.client = newEngineHTTPClient(20 * time.Millisecond)
@@ -129,8 +138,8 @@ func TestOnlyOllamaRunModelUsesSlowResponseHeaderBudget(t *testing.T) {
 		t.Fatal(err)
 	}
 	otherState.running = true
-	if _, err := otherEx.Action(context.Background(), "other", "run_model", json.RawMessage(`{"model":"tiny"}`)); err == nil || !strings.Contains(err.Error(), "timeout awaiting response headers") {
-		t.Fatalf("non-Ollama run_model error = %v, want ordinary response-header timeout", err)
+	if _, err := otherEx.Action(context.Background(), "other", "run_model", json.RawMessage(`{"model":"tiny"}`)); err != nil {
+		t.Fatalf("non-ollama slow_load run_model should also get the slow budget, got: %v", err)
 	}
 }
 

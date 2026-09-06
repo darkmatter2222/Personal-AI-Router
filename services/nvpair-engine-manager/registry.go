@@ -199,6 +199,23 @@ type Action struct {
 	// only a restart makes the deletion visible to clients. A stopped engine is
 	// left stopped; a restart failure fails the action.
 	RestartAfter bool `json:"restart_after,omitempty"`
+	// ReadOnly marks an action that only OBSERVES the engine (list models, loaded
+	// models, health/status) and never mutates its process, files, configuration
+	// or loaded models. It is the fail-safe boundary for external/adopt-only
+	// engines: such an engine may run ONLY its read-only actions; every other
+	// action is refused before execution. Built-in (managed) engines are
+	// unaffected, so existing manifests need not set it.
+	ReadOnly bool `json:"read_only,omitempty"`
+	// TimeoutMS is an explicit per-action overall timeout (context deadline) in
+	// milliseconds, for an action that legitimately runs long (e.g. a model
+	// pull). Zero falls back to the engine's routing ActionMS, then the global
+	// default. This replaces engine-name-specific timeout special-casing with a
+	// declarative contract.
+	TimeoutMS int `json:"timeout_ms,omitempty"`
+	// SlowLoad marks an action whose response headers may take a long time (a
+	// cold model load), selecting the long response-header client instead of the
+	// ordinary one. Declared per action rather than keyed on engine brand.
+	SlowLoad bool `json:"slow_load,omitempty"`
 }
 
 // ActionResult is the list-extraction spec on an Action (see Action.Result).

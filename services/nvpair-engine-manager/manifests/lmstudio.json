@@ -56,12 +56,14 @@
     "list_models": {
       "description": "List models available on this system (native REST v1).",
       "http": { "method": "GET", "path": "/api/v1/models" },
-      "result": { "array": "models", "field": "key" }
+      "result": { "array": "models", "field": "key" },
+      "read_only": true
     },
     "loaded_models": {
       "description": "List models currently loaded in memory (native REST v1, filtered by nonempty loaded_instances).",
       "http": { "method": "GET", "path": "/api/v1/models" },
-      "result": { "array": "models", "field": "key", "match": { "field": "loaded_instances", "nonempty": true } }
+      "result": { "array": "models", "field": "key", "match": { "field": "loaded_instances", "nonempty": true } },
+      "read_only": true
     },
     "pull_model": {
       "description": "Download a model via the lms CLI (params: {\"model\": \"<owner/name | huggingface.co or lmstudio.ai URL>\"}). Tries the value as given, then the LM Studio Hub artifact id, then the Hugging Face repo URL. Resumes automatically on a transient download timeout.",

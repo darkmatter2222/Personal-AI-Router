@@ -86,12 +86,14 @@
     "list_models": {
       "description": "List models installed on this engine.",
       "http": { "method": "GET", "path": "/api/tags" },
-      "result": { "array": "models", "field": "name" }
+      "result": { "array": "models", "field": "name" },
+      "read_only": true
     },
     "loaded_models": {
       "description": "List models currently loaded in memory (every /api/ps entry is resident).",
       "http": { "method": "GET", "path": "/api/ps" },
-      "result": { "array": "models", "field": "name" }
+      "result": { "array": "models", "field": "name" },
+      "read_only": true
     },
     "pull_model": {
       "description": "Pull a model by name (params: {\"name\": \"<model>\"}).",
@@ -99,7 +101,8 @@
     },
     "run_model": {
       "description": "Run a one-shot generation (params: {\"model\": \"<model>\", \"prompt\": \"<text>\", \"stream\": false}).",
-      "http": { "method": "POST", "path": "/api/generate", "body_schema": { "model": "string", "prompt": "string", "stream": "bool" } }
+      "http": { "method": "POST", "path": "/api/generate", "body_schema": { "model": "string", "prompt": "string", "stream": "bool" } },
+      "slow_load": true
     },
     "unload_model": {
       "description": "Unload a model from memory (params: {\"model\": \"<model>\", \"keep_alive\": 0}).",

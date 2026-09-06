@@ -44,3 +44,21 @@ func (e *Executor) guardOp(engine string, op routing.LifecycleOp) error {
 func (e *Executor) externalEngine(engine string) bool {
 	return e.engineLifecycle(engine).External()
 }
+
+// actionAllowedForExternal reports whether an action may run on the engine given
+// its lifecycle. A managed engine permits every action (subject to its own
+// manifest); an external/adopt-only engine permits ONLY actions explicitly
+// declared read_only. It reads the registry alone (no engine state), so a
+// mutating action is refused before any state access or execution. An external
+// engine that is unknown, or an action that is unknown/unmarked, is refused.
+func (e *Executor) actionAllowedForExternal(engine, action string) bool {
+	if !e.externalEngine(engine) {
+		return true
+	}
+	mf, ok := e.reg.Get(engine)
+	if !ok {
+		return false
+	}
+	a, ok := mf.Actions[action]
+	return ok && a.ReadOnly
+}

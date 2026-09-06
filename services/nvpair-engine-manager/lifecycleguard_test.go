@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"nvpair-shared/routing"
 )
@@ -89,5 +90,72 @@ func TestExternalLifecycleGuard_HelperMatrix(t *testing.T) {
 	}
 	if e.externalEngine("unknown-engine") {
 		t.Error("an unknown engine must default to managed, not external")
+	}
+}
+
+// TestExternalEngine_ActionGuardBlocksMutationBeforeExecution is the critical
+// Phase-7 test: a dangerous mutating action on an external engine is refused by
+// the production Action entry point BEFORE any command could run. The guard
+// resolves from the registry alone, so a minimal Executor exercises the real
+// refusal path; the fake command (which would fail loudly if ever executed) is
+// never reached.
+func TestExternalEngine_ActionGuardBlocksMutationBeforeExecution(t *testing.T) {
+	ext := &Manifest{
+		Engine:   "ext-runtime",
+		Routing:  &routing.EngineRouting{Lifecycle: routing.LifecycleExternal},
+		Actions: map[string]Action{
+			// A mutating action with a command that must NEVER run.
+			"pull_model":  {Cmd: []string{"THIS-COMMAND-MUST-NEVER-RUN", "--yes"}},
+			"delete_model": {RemovePath: &ActionRemovePath{Path: "{model}", Root: "{models_dir}"}},
+			"run_model":   {HTTP: &ActionHTTP{Method: "POST", Path: "/generate"}},
+			// A read-only action IS permitted past the guard.
+			"list_models": {HTTP: &ActionHTTP{Method: "GET", Path: "/v1/models"}, ReadOnly: true},
+		},
+	}
+	e := &Executor{reg: regWith(ext)}
+	ctx := context.Background()
+	for _, a := range []string{"pull_model", "delete_model", "run_model"} {
+		if _, err := e.Action(ctx, "ext-runtime", a, nil); !errors.Is(err, ErrExternalLifecycle) {
+			t.Fatalf("mutating action %q on external engine must be refused, got %v", a, err)
+		}
+	}
+	// The guard decision itself: read-only allowed, mutating/unknown refused.
+	if !e.actionAllowedForExternal("ext-runtime", "list_models") {
+		t.Fatal("read-only action must be allowed on an external engine")
+	}
+	if e.actionAllowedForExternal("ext-runtime", "pull_model") {
+		t.Fatal("mutating action must be refused on an external engine")
+	}
+	if e.actionAllowedForExternal("ext-runtime", "no_such_action") {
+		t.Fatal("unknown action must be refused on an external engine")
+	}
+	// A managed engine allows any action past this guard (subject to its manifest).
+	managed := &Manifest{Engine: "managed", Actions: map[string]Action{"pull_model": {Cmd: []string{"x"}}}}
+	em := &Executor{reg: regWith(managed)}
+	if !em.actionAllowedForExternal("managed", "pull_model") {
+		t.Fatal("managed engine must allow its actions past the external guard")
+	}
+}
+
+// TestResolveActionTimeout proves the declarative action-timeout contract
+// (Phase 5): explicit per-action timeout_ms wins, then the engine's routing
+// ActionMS, then the global default.
+func TestResolveActionTimeout(t *testing.T) {
+	e := &Executor{actionTimeout: 30 * time.Minute}
+
+	if got := e.resolveActionTimeout(&engineState{manifest: &Manifest{}}, Action{TimeoutMS: 5000}); got != 5*time.Second {
+		t.Fatalf("per-action timeout_ms = %v, want 5s", got)
+	}
+	routed := &engineState{manifest: &Manifest{Routing: &routing.EngineRouting{Timeouts: routing.Timeouts{ActionMS: 60000}}}}
+	if got := e.resolveActionTimeout(routed, Action{}); got != 60*time.Second {
+		t.Fatalf("routing ActionMS = %v, want 60s", got)
+	}
+	if got := e.resolveActionTimeout(&engineState{manifest: &Manifest{}}, Action{}); got != 30*time.Minute {
+		t.Fatalf("default action timeout = %v, want 30m", got)
+	}
+	// Per-action wins over routing.
+	both := &engineState{manifest: &Manifest{Routing: &routing.EngineRouting{Timeouts: routing.Timeouts{ActionMS: 60000}}}}
+	if got := e.resolveActionTimeout(both, Action{TimeoutMS: 1000}); got != time.Second {
+		t.Fatalf("per-action must win over routing, got %v", got)
 	}
 }

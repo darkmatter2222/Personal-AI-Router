@@ -17,11 +17,20 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"nvpair-shared/routing"
 )
 
 // Action runs a manifest-declared action against the engine and, when the
 // action declares restart_after, restarts the engine on success.
 func (e *Executor) Action(ctx context.Context, engine, action string, params json.RawMessage) (json.RawMessage, error) {
+	// External-lifecycle enforcement FIRST, resolved from the registry so it runs
+	// before any engine-state access, process spawn, HTTP call or filesystem
+	// removal. An external/adopt-only engine may run ONLY actions explicitly
+	// declared read_only; every mutating action is refused here.
+	if !e.actionAllowedForExternal(engine, action) {
+		return nil, fmt.Errorf("action %q: %w", action, ErrExternalLifecycle)
+	}
 	st, err := e.state(engine)
 	if err != nil {
 		return nil, err
@@ -42,6 +51,20 @@ func (e *Executor) Action(ctx context.Context, engine, action string, params jso
 		}
 	}
 	return res, nil
+}
+
+// resolveActionTimeout picks the context deadline for an action: an explicit
+// per-action timeout_ms, else the engine's declared routing ActionMS, else the
+// global default. This is the declarative replacement for engine-name timeout
+// special-casing; a manifest that declares neither keeps the default.
+func (e *Executor) resolveActionTimeout(st *engineState, act Action) time.Duration {
+	if act.TimeoutMS > 0 {
+		return time.Duration(act.TimeoutMS) * time.Millisecond
+	}
+	if st.manifest.Routing != nil && st.manifest.Routing.Timeouts.ActionMS > 0 {
+		return time.Duration(st.manifest.Routing.Timeouts.ActionMS) * time.Millisecond
+	}
+	return e.actionTimeout
 }
 
 // restartAfterAction restarts a running engine after one of its actions
@@ -85,7 +108,7 @@ func (e *Executor) restartAfterAction(ctx context.Context, st *engineState, engi
 // command, or an HTTP call against the engine's loopback control API with the
 // caller's params as the body.
 func (e *Executor) dispatchAction(ctx context.Context, st *engineState, engine, action string, act Action, params json.RawMessage) (json.RawMessage, error) {
-	ctx, cancel := context.WithTimeout(ctx, e.actionTimeout)
+	ctx, cancel := context.WithTimeout(ctx, e.resolveActionTimeout(st, act))
 	defer cancel()
 	st.mu.Lock()
 	running := st.running
@@ -125,8 +148,19 @@ func (e *Executor) dispatchAction(ctx context.Context, st *engineState, engine, 
 		req.Header.Set("Content-Type", "application/json")
 	}
 	req.Header.Set(engineIdentityProbeHeader, "1")
+	// Apply the engine's node-local backend credentials, if declared. This is the
+	// same tested primitive the inference proxy uses; the secret is resolved from
+	// the local environment here and never leaves this node. Errors never contain
+	// the credential value.
+	if st.manifest.Auth != nil {
+		if aerr := routing.ApplyAuth(req.Header, *st.manifest.Auth, os.Getenv); aerr != nil {
+			return nil, fmt.Errorf("action %q: %w", action, aerr)
+		}
+	}
+	// Select the long response-header client for an action that declares it may
+	// load slowly (a cold model), rather than special-casing an engine brand.
 	client := e.client
-	if engine == "ollama" && action == "run_model" && e.ollamaLoadClient != nil {
+	if act.SlowLoad && e.ollamaLoadClient != nil {
 		client = e.ollamaLoadClient
 	}
 	resp, err := client.Do(req)
