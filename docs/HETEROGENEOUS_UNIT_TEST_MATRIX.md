@@ -96,6 +96,29 @@ because the engine-manager package has pre-existing subprocess/TestMain tests
 unattended. The enforcement DECISION is proven offline by the routing package's
 `lifecycle_test.go`; the WIRING is proven by review and this test on a dev box.
 
+## Hardening / edge-case suites (added second pass)
+
+About 50 additional tests targeting gaps, grouped by area. All land in packages
+the offline script already runs, so they execute automatically.
+
+| File | Focus | Notable cases |
+| --- | --- | --- |
+| classify_edge_test.go | Real-world request shapes (Ollama + OpenAI) | keep_alive/raw/format/think, deprecated `context` int array, `tool_choice:none`, legacy `function_call`, missing/null/number/bool content, `image_url` bare-string + data-URI, Anthropic `source` images, `stream_options`, **`num_ctx` context floor + eligibility gate**, output precedence at 0/null/huge, emoji/CJK rune counting, whitespace-only, embeddings shapes |
+| eligibility_edge_test.go | Multi-model engines | matched-model caps/context (vision vs text vs tools), ollama↔ollama family, empty-model set, metadata-only caps do not gate, unneeded caps do not gate |
+| policy_edge_test.go | Ordering edges | omitted priority sorts last, stale/duplicate scheduler-order ids, single-ineligible, full mixed explanation with distinct reasons, deterministic-on-last |
+| capacity_edge_test.go | Admission edges | release-order independence, same-caps reconcile preserves in-flight, reconfigure-to-unbounded, Available boundaries, per-id independence, reconcile-vs-release race |
+| auth_edge_test.go | Header application | multiple distinct headers, unrelated-header preservation, internal-space values, single-char env value |
+| forward_edge_test.go | Executor edges | multi-chunk stream ordering, empty-body commit, method/path passthrough, rewrite-disabled body preservation, all-candidates header timeout -> local 503 + released |
+| validate_edge_test.go | Contract validation | model-name length boundary (512 ok, 513 rejected), alias rules (dup alias ok, dup physical rejected, slash/colon ok, control char rejected) |
+| open_engine_edge_test.go (scheduler) | Open engine set | dedup across modelsByEngine/routingByEngine keys, single-node engine still emits |
+| routing_meta_edge_test.go (noderec) | Wire round-trip | multiple engines' routing metadata round-trip independently |
+
+Production change accompanying these: `Classify` now treats Ollama
+`options.num_ctx` as a requested-context floor (`RequiredContext = max(estimated
+conversation size, num_ctx)`), so a request that explicitly asks for a large
+window is gated against a too-small model. Status: STATICALLY VALIDATED, NOT
+EXECUTED.
+
 ## Not directly unit-tested here (deferred, with rationale)
 
 - **Broker projection** (`directoryToEnriched`/`toAvailable` RoutingByEngine
