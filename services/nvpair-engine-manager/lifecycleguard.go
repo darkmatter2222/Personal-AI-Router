@@ -19,9 +19,18 @@ var ErrExternalLifecycle = errors.New("engine is externally managed (adopt-only)
 
 // engineLifecycle returns the declared lifecycle mode for an engine. An engine
 // whose manifest declares no routing block is managed (the default), preserving
-// existing behaviour for the built-in engines.
+// existing behaviour for the built-in engines. An engine that declares the
+// external runtime mode is adopt-only even without routing metadata, so the
+// guard cannot be bypassed by omitting the routing block.
 func (e *Executor) engineLifecycle(engine string) routing.LifecycleMode {
-	if mf, ok := e.reg.Get(engine); ok && mf.Routing != nil {
+	mf, ok := e.reg.Get(engine)
+	if !ok {
+		return routing.LifecycleManaged
+	}
+	if mf.external() {
+		return routing.LifecycleExternal
+	}
+	if mf.Routing != nil {
 		return mf.Routing.Lifecycle
 	}
 	return routing.LifecycleManaged

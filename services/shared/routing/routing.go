@@ -33,7 +33,10 @@
 // engages only for endpoints an operator has actually described.
 package routing
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // APIFamily is the wire/API contract an endpoint speaks, represented
 // independently of the engine brand. Two different runtimes (say vLLM and
@@ -257,9 +260,18 @@ func (e EngineRouting) External() bool { return e.Lifecycle.External() }
 // plane maintains. Decide operates on a slice of these, which keeps it a pure
 // function of already-materialised inputs.
 type Endpoint struct {
-	// ID is a stable, unique endpoint identifier used for deterministic
-	// tie-breaking and for keying the admission pool. Typically hostUUID+engine.
+	// ID is the EndpointID: a stable, unique identifier for one runtime
+	// deployment. It keys the admission pool, the deterministic tie-break, and
+	// target resolution. It is NOT the node identity; a single node hosting two
+	// engines has two distinct endpoint IDs but one NodeID. Build it with
+	// EndpointKey so the (node, engine) pair cannot collide.
 	ID string
+	// NodeID is the stable PAIR host identity that owns this endpoint. It is the
+	// scheduler ranking key for the default strategy: two endpoints on the same
+	// node share a NodeID and therefore a rank, while remaining independently
+	// admissible via their distinct EndpointID. When empty, ranking falls back to
+	// ID so legacy single-endpoint callers keep their behaviour.
+	NodeID string
 	// Engine is the (arbitrary) engine id this endpoint runs.
 	Engine string
 	// APIFamily is the wire contract; APIFamilyUnknown disables the family gate.
@@ -282,10 +294,22 @@ type Endpoint struct {
 
 // Endpoint builds a resolved Endpoint from this EngineRouting for the given
 // stable id, engine id and runtime health. It applies every default so callers
-// (and tests) get one materialisation path.
+// (and tests) get one materialisation path. The legacy form treats the endpoint
+// as its own node (NodeID == ID), which preserves single-endpoint ranking
+// behaviour. Heterogeneous callers that host several engines per node should use
+// EndpointFor to keep NodeID and EndpointID distinct.
 func (e EngineRouting) Endpoint(id, engine string, healthy bool) Endpoint {
+	return e.EndpointFor(id, id, engine, healthy)
+}
+
+// EndpointFor builds a resolved Endpoint with an explicit NodeID (scheduler
+// ranking key) and EndpointID (admission/tie-break/target key). This is the
+// heterogeneous materialisation path: one node may produce several endpoints
+// with a shared NodeID and distinct EndpointIDs (one per engine).
+func (e EngineRouting) EndpointFor(nodeID, endpointID, engine string, healthy bool) Endpoint {
 	return Endpoint{
-		ID:        id,
+		ID:        endpointID,
+		NodeID:    nodeID,
 		Engine:    engine,
 		APIFamily: e.APIFamily,
 		Strategy:  e.ResolvedStrategy(),
@@ -297,6 +321,16 @@ func (e EngineRouting) Endpoint(id, engine string, healthy bool) Endpoint {
 		Timeouts:  e.Timeouts,
 		Models:    e.Models,
 	}
+}
+
+// EndpointKey builds a collision-free EndpointID from a node identity and an
+// engine identity. The two components are joined with a NUL byte, which cannot
+// appear in a PAIR host UUID or in a validated engine id (engine ids match
+// [A-Za-z0-9._-]+), so distinct (node, engine) pairs always produce distinct
+// keys and no concatenation ambiguity is possible. A future third component
+// (a per-node deployment ordinal) can be appended with the same separator.
+func EndpointKey(parts ...string) string {
+	return strings.Join(parts, "\x00")
 }
 
 // msOr converts a non-positive millisecond count to the fallback duration and a

@@ -64,4 +64,44 @@ Desktop node_modules is absent. Git author name/email are unset. Do not install
 or fetch dependencies, fabricate commit identity, or treat unavailable tests as
 passing. Existing service TestMain functions and listener/subprocess tests make
 broad go test ./... unsafe; the offline script must use an explicit allowlist.
-The supplied goal prohibits pushes; all work stays local.
+
+## Cross-engine hardening pass
+
+This pass turned the routing foundation into genuinely heterogeneous,
+cross-engine routing and hardened the request path. Delivered offline and
+verified by adversarial model review (no Go toolchain is present to execute):
+
+- **Cross-engine routing.** `routeadapter` now considers candidates across ALL
+  engine ids a node declares (optional `EngineFilter`), not one engine per
+  router. One alias spans different runtimes; each outbound request carries the
+  chosen endpoint's own physical model name.
+- **Node vs endpoint identity.** `routing.Endpoint`/`Placement` carry both
+  `NodeID` (scheduler rank) and `EndpointID` (admission/tie-break/target),
+  built with a collision-free `routing.EndpointKey`. Multiple engines on one node
+  admit and fail over independently while sharing one rank.
+- **Strategy after eligibility.** `routing.DecideResolved` resolves the strategy
+  from the ELIGIBLE set only, so an ineligible endpoint cannot dictate ordering.
+- **Safe request bodies.** Oversize → 413 (no truncation, no upstream), read
+  error → 400, malformed JSON → 400 (not a routing 503), legacy fallback
+  preserves the body byte-for-byte.
+- **Mixed clusters.** Enhanced-empty-`Models` and legacy nodes synthesise
+  conservative inventory candidates (text/streaming only; no invented
+  vision/tools).
+- **External/adopt runtime mode** with validation and a guard that treats it as
+  adopt-only even without routing metadata; action-contradiction validation
+  (`read_only`+`restart_after`/`remove_path`, negative timeout, `slow_load` on a
+  non-HTTP action); external engines may declare only read-only actions.
+- **Configurable context reserves** (`routing.ReservePolicy`).
+- **Accurate reason codes** (a 408/429 is `UPSTREAM_RETRYABLE_STATUS`, not
+  `UPSTREAM_5XX`).
+- **Readiness script** separates mandatory failures from optional skips (an
+  optional skip no longer fails readiness), adds a routeadapter coverage gate and
+  runs a pure, non-spawning engine-manager validation/guard subset in the gate.
+
+Not yet done (gated on a Go toolchain, which is absent here): executing the
+suites; wiring the shared adapter into the live `ollama-proxy`/`lmstudio-proxy`
+handlers (designed, deferred so the live inference path is compiled and verified,
+not blind-edited); owner-side admission at cluster ingress; widening desktop
+`EngineId` for generic identities. The verdict remains NOT READY FOR REAL-BACKEND
+INTEGRATION TESTING until the suites run green twice on a toolchain box and the
+proxy wiring lands. Pushes to the user's fork are authorised this session.

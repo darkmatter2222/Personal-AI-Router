@@ -141,6 +141,28 @@ transport). The engine-manager action tests are dev-box only (that package has
 pre-existing subprocess/TestMain tests); the enforcement decisions they cover are
 also proven offline in the routing package.
 
+## Third pass — cross-engine + request-path hardening
+
+New/changed functions and their direct tests (all reviewed compile-clean; NOT
+EXECUTED — no Go toolchain in this environment).
+
+| Package/file | Function | Tests |
+| --- | --- | --- |
+| routing/routing.go | `Endpoint.NodeID`, `EndpointFor`, `EndpointKey` | (exercised across routeadapter cross-engine + same-node tests) |
+| routing/policy.go | `Placement.NodeID`, default rank by NodeID, `DecideResolved` (strategy from eligible set) | TestRoute_IneligibleDeterministicEndpointDoesNotForceStrategy (+ existing policy tests unchanged) |
+| routing/classify.go | `ReservePolicy`, `ClassifyRequest`, `ErrMalformedBody` | TestRoute_ConfigurableOutputReserveAffectsContextGate, _MalformedJSONReturns400NotRoutingError, _EmptyBodyIsNotMalformed |
+| routing/reasons.go, forward.go | `ReasonUpstreamRetryableStatus`/`RequestTooLarge`/`BadRequest`; accurate `reasonForStatus` (408/429 not 5xx) | (asserted via body tests + existing failover tests) |
+| routeadapter/routeadapter.go | cross-engine `EnhancedEndpoints`, `LegacyCandidates`, `EngineFilter`, safe body handling, `DecideResolved` wiring | TestCrossEngine_HeterogeneousRouting (text→A, A full→B, A+B full→C, vision→C, A unhealthy→B, A retryable→B; each rewrites to the endpoint's physical), TestSameNode_MultiEngine (distinct EndpointIDs, independent pools, shared NodeID rank), TestCrossEngine_MixedAPIFamily |
+| routeadapter (body) | 413/400/legacy-restore | TestRoute_LegacyFallbackPreservesBody (byte-for-byte), _OversizeBodyReturns413, _ContentLengthOverLimitReturns413WithoutReading, _ExactLimitIsAccepted, _BodyReadErrorReturns400 |
+| routeadapter (mixed) | Phase 6/7 synthesis | TestRoute_MixedClusterLegacyNodeStaysReachable, _MixedClusterLegacyNeverGetsCapabilityTraffic, _EmptyModelsFallsBackToInventory |
+| engine-manager/registry.go | external runtime mode, action-contradiction validation | TestExternalRuntime_PortAndHealthIsValidWithoutBin, _PortOnlyIsValid, _PortRequired, _StartRejected, _StopRejected, _BinRejected, _InstallRejected, _UninstallRejected, TestManagedProcess_RequiresBin, TestAction_NegativeTimeoutRejected, _ReadOnlyRestartAfterRejected, _ReadOnlyRemovePathRejected, _SlowLoadNonHTTPRejected, TestExternalEngine_NonReadOnlyActionRejected, _ReadOnlyActionsValid |
+| engine-manager/lifecycleguard.go | runtime-external is adopt-only without routing block | TestRuntimeExternal_IsAdoptOnlyWithoutRoutingBlock, _ActionGuardAllowsOnlyReadOnly |
+
+The engine-manager third-pass tests are PURE (manifest validation + guard; no
+process, socket or network) and are now included in the offline readiness gate
+via a name-scoped `-run` selection (the package TestMain still compiles helper
+binaries offline, so nothing is installed or launched).
+
 ## Not directly unit-tested here (deferred, with rationale)
 
 - **Broker projection** (`directoryToEnriched`/`toAvailable` RoutingByEngine

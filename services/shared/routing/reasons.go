@@ -65,10 +65,27 @@ const (
 	// ReasonFirstByteTimeout: headers arrived but the first output byte did not,
 	// within the endpoint's first-byte timeout (a cold model / stalled generation).
 	ReasonFirstByteTimeout Reason = "UPSTREAM_FIRST_BYTE_TIMEOUT"
-	// ReasonUpstream5xx: the upstream returned a retryable server error status.
+	// ReasonUpstreamRetryableStatus: the upstream returned a retryable status that
+	// is NOT a server error, so it must not be mislabelled 5xx. It covers 408
+	// (request timeout) and 429 (too many requests): PAIR fails over to the next
+	// eligible endpoint rather than surfacing the status.
+	ReasonUpstreamRetryableStatus Reason = "UPSTREAM_RETRYABLE_STATUS"
+	// ReasonUpstream5xx: the upstream returned a retryable server error status
+	// (500/502/503/504).
 	ReasonUpstream5xx Reason = "UPSTREAM_5XX"
 	// ReasonClientCancelled: the client's context was cancelled before commit.
 	ReasonClientCancelled Reason = "CLIENT_CANCELLED"
+
+	// Request-level reasons produced before any endpoint is tried. They describe a
+	// client error, not a routing failure, so a request path returns a 4xx rather
+	// than a routing 503.
+
+	// ReasonRequestTooLarge: the request body exceeded the configured maximum, so
+	// it was rejected with 413 without contacting any backend or truncating it.
+	ReasonRequestTooLarge Reason = "REQUEST_TOO_LARGE"
+	// ReasonBadRequest: the request body could not be read or is not valid JSON
+	// for any recognised request shape, so it was rejected with 400.
+	ReasonBadRequest Reason = "BAD_REQUEST"
 )
 
 // String returns the reason code as a string.

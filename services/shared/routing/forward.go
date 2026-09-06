@@ -574,14 +574,18 @@ func shouldRetryStatus(code int, isInference bool) bool {
 	}
 }
 
-// reasonForStatus maps a retryable status to a recordable reason.
+// reasonForStatus maps a retryable status to an accurate recordable reason so a
+// routing trace distinguishes a stale-inventory 404, a non-5xx retryable status
+// (408/429), and a genuine upstream server error (5xx). A 408 request timeout is
+// NOT a server error and must never be recorded as UPSTREAM_5XX.
 func reasonForStatus(code int) Reason {
 	switch code {
-	case http.StatusNotFound:
+	case http.StatusNotFound: // 404 (inference stale inventory)
 		return ReasonModelNotAvailable
-	case http.StatusTooManyRequests, http.StatusServiceUnavailable:
-		return ReasonEndpointUnhealthy
-	default:
+	case http.StatusRequestTimeout, // 408
+		http.StatusTooManyRequests: // 429
+		return ReasonUpstreamRetryableStatus
+	default: // 500/502/503/504
 		return ReasonUpstream5xx
 	}
 }

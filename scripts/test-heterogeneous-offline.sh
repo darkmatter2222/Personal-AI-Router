@@ -13,8 +13,10 @@
 # than fetching it); no network (GOPROXY=off); launches no engine/service/
 # deployment; runs NO cross-process integration tests (never `go test ./...` at
 # the services root, never services/tests, never `-tags live`); no interaction.
-# Readiness mode fails on a missing Go toolchain, any skipped mandatory check,
-# an unavailable race detector, or routing coverage below the threshold.
+# Readiness mode fails on a missing Go toolchain, any skipped MANDATORY check,
+# an unavailable race detector, or a package coverage below its threshold. A
+# NON-mandatory skip (e.g. desktop node_modules absent when no desktop code
+# changed) never fails readiness — only mandatory failures do.
 
 set -uo pipefail
 
@@ -36,6 +38,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SERVICES="$REPO_ROOT/services"
 DESKTOP="$REPO_ROOT/desktop"
 ROUTING_COVERAGE_MIN="98.0"
+ROUTEADAPTER_COVERAGE_MIN="88.0"
 
 FAILURES=0; RAN=0; SKIPPED=0
 
@@ -74,6 +77,14 @@ section "Go unit/component tests (allowlist)"
 if $HAS_GO; then
     go_test "$SERVICES/shared" "shared routing/routeadapter/noderec/schedulerwire" ./routing/... ./routeadapter/... ./noderec/... ./schedulerwire/...
     go_test "$SERVICES/nvpair-job-scheduler" "nvpair-job-scheduler" ./...
+    # Engine-manager critical, PURE logic: manifest validation (external/adopt
+    # runtime mode, action contradictions) and the external-lifecycle action
+    # guard. The -run pattern selects ONLY these dependency-light tests, none of
+    # which spawn a process, open a socket or contact the network. The package's
+    # TestMain compiles helper binaries (offline; no engine launch), so this
+    # still installs nothing and starts nothing.
+    go_test "$SERVICES/nvpair-engine-manager" "engine-manager manifest-validation + lifecycle-guard (pure subset)" \
+        -run 'TestExternalRuntime|TestManagedProcess|TestAction_|TestExternalEngine|TestRuntimeExternal' .
 else
     skip_or_fail "go not on PATH — Go unit tests not executed" true
 fi
@@ -103,6 +114,22 @@ else
     skip_or_fail "go not on PATH — coverage not measured" true
 fi
 
+section "Go coverage (routeadapter package, min ${ROUTEADAPTER_COVERAGE_MIN}%)"
+if $HAS_GO; then
+    COVER="$(mktemp)"
+    ( cd "$SERVICES/shared" && go test -coverprofile="$COVER" ./routeadapter/... ); rc=$?
+    if [ $rc -ne 0 ]; then
+        fail "routeadapter coverage run failed (exit $rc)"
+    else
+        TOTAL="$( cd "$SERVICES/shared" && go tool cover -func="$COVER" | awk '/total:/{print $NF}' | tr -d '%' )"
+        echo "routeadapter total coverage: ${TOTAL}%"
+        if awk "BEGIN{exit !($TOTAL >= $ROUTEADAPTER_COVERAGE_MIN)}"; then pass "routeadapter coverage ${TOTAL}% >= ${ROUTEADAPTER_COVERAGE_MIN}%"; else fail "routeadapter coverage ${TOTAL}% < ${ROUTEADAPTER_COVERAGE_MIN}%"; fi
+    fi
+    rm -f "$COVER"
+else
+    skip_or_fail "go not on PATH — routeadapter coverage not measured" true
+fi
+
 section "Desktop typecheck + unit tests"
 if $HAS_NODE && $HAS_NM; then
     ( cd "$DESKTOP" && npm run typecheck ); [ $? -eq 0 ] && pass "desktop typecheck" || fail "desktop typecheck"
@@ -116,11 +143,12 @@ else
 fi
 
 section "Summary"
-echo "ran=$RAN failures=$FAILURES skipped=$SKIPPED"
+# In readiness mode a skipped MANDATORY check is already counted as a FAILURE
+# (see skip_or_fail), so FAILURES==0 guarantees every mandatory check executed
+# and passed. The SKIPPED counter therefore holds only NON-mandatory skips,
+# which are informational and never fail readiness (Phase 23).
+echo "ran=$RAN failures=$FAILURES skipped=$SKIPPED (skipped are non-mandatory)"
 if [ "$FAILURES" -gt 0 ]; then echo "RESULT: FAIL"; exit 1; fi
-if $READINESS; then
-    if [ "$SKIPPED" -gt 0 ]; then echo "RESULT: FAIL (readiness: $SKIPPED mandatory check(s) skipped)"; exit 1; fi
-    echo "RESULT: PASS (readiness)"; exit 0
-fi
+if $READINESS; then echo "RESULT: PASS (readiness)"; exit 0; fi
 if [ "$RAN" -eq 0 ]; then echo "RESULT: NO CHECKS EXECUTED (toolchains unavailable). Nothing failed, nothing proven."; exit 0; fi
 echo "RESULT: PASS (developer)"; exit 0

@@ -10,10 +10,12 @@
   Developer (default) — skips are allowed and clearly reported; the script exits
     nonzero only when a check that RAN failed. Useful on a box without the full
     toolchain.
-  Readiness — every mandatory check MUST execute and pass. A missing Go
-    toolchain, a skipped required suite, an unavailable race detector, or
-    sub-threshold routing coverage all FAIL. This is the gate for declaring the
-    branch READY FOR REAL-BACKEND INTEGRATION TESTING.
+  Readiness — every MANDATORY check MUST execute and pass. A missing Go
+    toolchain, a skipped mandatory suite, an unavailable race detector, or a
+    sub-threshold package coverage all FAIL. A NON-mandatory skip (e.g. desktop
+    node_modules absent when no desktop code changed) is informational and never
+    fails readiness. This is the gate for declaring the branch READY FOR
+    REAL-BACKEND INTEGRATION TESTING.
 
 .DESCRIPTION
   Guarantees in BOTH modes (by construction):
@@ -54,8 +56,10 @@ $RepoRoot = Split-Path -Parent $PSScriptRoot
 $Services = Join-Path $RepoRoot 'services'
 $Desktop  = Join-Path $RepoRoot 'desktop'
 
-# Routing statement-coverage gate (Readiness mode).
+# Package statement-coverage gates (Readiness mode). Package-specific, meaningful
+# targets rather than one repository-wide number.
 $RoutingCoverageMin = 98.0
+$RouteAdapterCoverageMin = 88.0
 
 $script:Failures = 0
 $script:Ran = 0
@@ -115,6 +119,12 @@ Section "Go unit/component tests (allowlist)"
 if ($HasGo) {
     Go-Test (Join-Path $Services 'shared') @('./routing/...','./routeadapter/...','./noderec/...','./schedulerwire/...') 'shared routing/routeadapter/noderec/schedulerwire'
     Go-Test (Join-Path $Services 'nvpair-job-scheduler') @('./...') 'nvpair-job-scheduler'
+    # Engine-manager critical, PURE logic only: manifest validation (external/adopt
+    # runtime mode, action contradictions) and the external-lifecycle action guard.
+    # The -run pattern selects ONLY these dependency-light tests — none spawn a
+    # process, open a socket or touch the network. The package TestMain compiles
+    # helper binaries (offline; no engine launch), so this installs/starts nothing.
+    Go-Test (Join-Path $Services 'nvpair-engine-manager') @('-run','TestExternalRuntime|TestManagedProcess|TestAction_|TestExternalEngine|TestRuntimeExternal','.') 'engine-manager manifest-validation + lifecycle-guard (pure subset)'
 } else {
     SkipOrFail "go not on PATH — Go unit tests not executed" $true
 }
@@ -161,6 +171,34 @@ if ($HasGo) {
     SkipOrFail "go not on PATH — coverage not measured" $true
 }
 
+# ---- Coverage gate (routeadapter package) -----------------------------------
+Section "Go coverage (routeadapter package, min $RouteAdapterCoverageMin`%)"
+if ($HasGo) {
+    Push-Location (Join-Path $Services 'shared')
+    try {
+        $cover = Join-Path ([System.IO.Path]::GetTempPath()) 'pair-routeadapter-cover.out'
+        Write-Host "> go test -coverprofile routeadapter coverage"
+        & go test -coverprofile="$cover" ./routeadapter/...
+        if ($LASTEXITCODE -ne 0) {
+            Fail "routeadapter coverage run failed (exit $LASTEXITCODE)"
+        } else {
+            $func = & go tool cover -func="$cover"
+            $totalLine = $func | Where-Object { $_ -match 'total:' } | Select-Object -Last 1
+            if ($totalLine -match '([\d.]+)%') {
+                $pct = [double]$Matches[1]
+                Write-Host "routeadapter total coverage: $pct`%"
+                if ($pct -ge $RouteAdapterCoverageMin) { Pass "routeadapter coverage $pct% >= $RouteAdapterCoverageMin%" }
+                else { Fail "routeadapter coverage $pct% < $RouteAdapterCoverageMin%" }
+            } else {
+                Fail "could not parse routeadapter coverage total"
+            }
+            Remove-Item $cover -ErrorAction SilentlyContinue
+        }
+    } finally { Pop-Location }
+} else {
+    SkipOrFail "go not on PATH — routeadapter coverage not measured" $true
+}
+
 # ---- Desktop typecheck + unit tests -----------------------------------------
 Section "Desktop typecheck + unit tests"
 if ($HasNode -and $HasNodeModules) {
@@ -183,16 +221,15 @@ if ($HasNode -and $HasNodeModules) {
 
 # ---- Summary ----------------------------------------------------------------
 Section "Summary"
-Write-Host "ran=$($script:Ran) failures=$($script:Failures) skipped=$($script:Skipped)"
+# A skipped MANDATORY check is already counted as a FAILURE (see SkipOrFail), so
+# in readiness mode Failures==0 guarantees every mandatory check executed and
+# passed. Skipped holds only NON-mandatory skips, which never fail readiness.
+Write-Host "ran=$($script:Ran) failures=$($script:Failures) skipped=$($script:Skipped) (skipped are non-mandatory)"
 if ($script:Failures -gt 0) {
     Write-Host "RESULT: FAIL" -ForegroundColor Red
     exit 1
 }
 if ($Readiness) {
-    if ($script:Skipped -gt 0) {
-        Write-Host "RESULT: FAIL (readiness mode: $($script:Skipped) mandatory check(s) skipped)" -ForegroundColor Red
-        exit 1
-    }
     Write-Host "RESULT: PASS (readiness)" -ForegroundColor Green
     exit 0
 }

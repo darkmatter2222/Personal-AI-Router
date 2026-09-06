@@ -68,6 +68,10 @@ func rtOK(code int, body string) func(*http.Request) (*http.Response, error) {
 
 // --- builders ---------------------------------------------------------------
 
+// epid mirrors the adapter's EndpointID construction so tests can key targets,
+// admission pools and served-endpoint assertions by the same collision-free key.
+func epid(host, engine string) string { return routing.EndpointKey(host, engine) }
+
 func caps(text, vision, tools, streaming bool) routing.Capabilities {
 	return routing.Capabilities{Text: text, Vision: vision, Tools: tools, Streaming: streaming}
 }
@@ -82,21 +86,34 @@ func dnode(uuid, engine string, r routing.EngineRouting) noderec.DirectoryNode {
 	return noderec.DirectoryNode{HostUUID: uuid, RoutingByEngine: map[string]routing.EngineRouting{engine: r}}
 }
 
-func newRouter(rt http.RoundTripper, ps *routing.Pools, engine string, nodes ...noderec.DirectoryNode) *Router {
+// newRouter wires a cross-engine Router (EngineFilter nil = all engines). Targets
+// are keyed by EndpointID; each endpoint's BaseURL host is the node's UUID so a
+// fakeRT can count dials by host for single-engine-per-node topologies.
+func newRouter(rt http.RoundTripper, ps *routing.Pools, nodes ...noderec.DirectoryNode) *Router {
 	targets := map[string]routing.Target{}
+	add := func(host, engine string) {
+		key := epid(host, engine)
+		if _, ok := targets[key]; !ok {
+			targets[key] = routing.Target{BaseURL: "http://" + host}
+		}
+	}
 	for _, n := range nodes {
-		targets[n.HostUUID] = routing.Target{BaseURL: "http://" + n.HostUUID}
+		for engine := range n.RoutingByEngine {
+			add(n.HostUUID, engine)
+		}
+		for engine := range n.ModelsByEngine {
+			add(n.HostUUID, engine)
+		}
 	}
 	return &Router{
-		Engine:      engine,
-		APIFamily:   routing.APIFamilyOpenAI,
-		Snapshot:    func() []noderec.DirectoryNode { return nodes },
-		Healthy:     func(n noderec.DirectoryNode) bool { return true },
-		Pools:       ps,
-		Transport:   rt,
-		TargetFor:   func(id string) (routing.Target, bool) { t, ok := targets[id]; return t, ok },
-		Defaults:    routing.TimeoutDefaults{ResponseHeader: 5 * time.Second, FirstByte: 5 * time.Second},
-		IsInference: true,
+		APIFamily:    routing.APIFamilyOpenAI,
+		Snapshot:     func() []noderec.DirectoryNode { return nodes },
+		Healthy:      func(n noderec.DirectoryNode) bool { return true },
+		Pools:        ps,
+		Transport:    rt,
+		TargetFor:    func(id string) (routing.Target, bool) { t, ok := targets[id]; return t, ok },
+		Defaults:     routing.TimeoutDefaults{ResponseHeader: 5 * time.Second, FirstByte: 5 * time.Second},
+		IsInference:  true,
 		RewriteModel: true,
 	}
 }
@@ -109,9 +126,11 @@ func route(rt *Router, body string) (bool, routing.ForwardResult, *httptest.Resp
 }
 
 // text/vision/tools helper bodies for logical model "chat".
-func textBody() string   { return `{"model":"chat","messages":[{"role":"user","content":"hi"}]}` }
-func imageBody() string  { return `{"model":"chat","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"x"}}]}]}` }
-func toolsBody() string  { return `{"model":"chat","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"f"}}]}` }
+func textBody() string  { return `{"model":"chat","messages":[{"role":"user","content":"hi"}]}` }
+func imageBody() string { return `{"model":"chat","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"x"}}]}]}` }
+func toolsBody() string {
+	return `{"model":"chat","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"f"}}]}`
+}
 
 // --- tests ------------------------------------------------------------------
 
@@ -119,7 +138,7 @@ func TestRoute_LegacyFallbackWhenNoMetadata(t *testing.T) {
 	// Nodes carry NO routing metadata for the engine -> Route declines (legacy).
 	f := &fakeRT{respond: rtOK(200, "x")}
 	n := noderec.DirectoryNode{HostUUID: "A"} // no RoutingByEngine
-	rt := newRouter(f, routing.NewPools(), "ollama", n)
+	rt := newRouter(f, routing.NewPools(), n)
 	handled, _, rec := route(rt, textBody())
 	if handled {
 		t.Fatal("no routing metadata must fall back to legacy (handled=false)")
@@ -136,9 +155,9 @@ func TestRoute_LegacyFallbackWhenNoMetadata(t *testing.T) {
 func TestRoute_BasicText(t *testing.T) {
 	f := &fakeRT{respond: rtOK(200, "hello")}
 	n := dnode("A", "e", er(routing.StrategyDeterministicPriority, 10, 0, model("phys-A", caps(true, false, true, true), 0, "chat")))
-	rt := newRouter(f, routing.NewPools(), "e", n)
+	rt := newRouter(f, routing.NewPools(), n)
 	handled, res, rec := route(rt, textBody())
-	if !handled || res.ServedEndpoint != "A" || rec.Body.String() != "hello" {
+	if !handled || res.ServedEndpoint != epid("A", "e") || rec.Body.String() != "hello" {
 		t.Fatalf("handled=%v served=%q body=%q", handled, res.ServedEndpoint, rec.Body.String())
 	}
 }
@@ -148,9 +167,9 @@ func TestRoute_VisionGate(t *testing.T) {
 	a := dnode("A", "e", er(routing.StrategyDeterministicPriority, 10, 0, model("pa", caps(true, false, false, true), 0, "chat")))
 	b := dnode("B", "e", er(routing.StrategyDeterministicPriority, 20, 0, model("pb", caps(true, false, false, true), 0, "chat")))
 	c := dnode("C", "e", er(routing.StrategyDeterministicPriority, 30, 0, model("pc", caps(true, true, false, true), 0, "chat")))
-	rt := newRouter(f, routing.NewPools(), "e", a, b, c)
+	rt := newRouter(f, routing.NewPools(), a, b, c)
 	handled, res, _ := route(rt, imageBody())
-	if !handled || res.ServedEndpoint != "C" {
+	if !handled || res.ServedEndpoint != epid("C", "e") {
 		t.Fatalf("image request must route only to the vision node C; served %q", res.ServedEndpoint)
 	}
 	if f.count("A") != 0 || f.count("B") != 0 || f.count("C") != 1 {
@@ -163,9 +182,9 @@ func TestRoute_ToolsGatePrefersCapableOverHigherPriority(t *testing.T) {
 	// A is higher priority (10) but cannot do tools; B (20) can.
 	a := dnode("A", "e", er(routing.StrategyDeterministicPriority, 10, 0, model("pa", caps(true, false, false, true), 0, "chat")))
 	b := dnode("B", "e", er(routing.StrategyDeterministicPriority, 20, 0, model("pb", caps(true, false, true, true), 0, "chat")))
-	rt := newRouter(f, routing.NewPools(), "e", a, b)
+	rt := newRouter(f, routing.NewPools(), a, b)
 	_, res, _ := route(rt, toolsBody())
-	if res.ServedEndpoint != "B" {
+	if res.ServedEndpoint != epid("B", "e") {
 		t.Fatalf("tools request must reach the capable lower-priority B, served %q", res.ServedEndpoint)
 	}
 	if f.count("A") != 0 {
@@ -176,7 +195,7 @@ func TestRoute_ToolsGatePrefersCapableOverHigherPriority(t *testing.T) {
 func TestRoute_AliasRewrittenToPhysical(t *testing.T) {
 	f := &fakeRT{respond: rtOK(200, "ok")}
 	n := dnode("A", "e", er(routing.StrategyDeterministicPriority, 10, 0, model("qwen-fast", caps(true, false, true, true), 0, "local-coding")))
-	rt := newRouter(f, routing.NewPools(), "e", n)
+	rt := newRouter(f, routing.NewPools(), n)
 	route(rt, `{"model":"local-coding","messages":[{"role":"user","content":"hi"}]}`)
 	got, ok := f.last("A")
 	if !ok || !strings.Contains(got.body, `"model":"qwen-fast"`) {
@@ -190,13 +209,13 @@ func TestRoute_AliasRewrittenToPhysical(t *testing.T) {
 func TestRoute_CapacitySpillover(t *testing.T) {
 	f := &fakeRT{respond: rtOK(200, "ok")}
 	ps := routing.NewPools()
-	hold, _ := ps.Reserve("A", 1) // occupy A's single slot
+	hold, _ := ps.Reserve(epid("A", "e"), 1) // occupy A's single slot
 	defer hold()
 	a := dnode("A", "e", er(routing.StrategyDeterministicPriority, 10, 1, model("pa", caps(true, false, false, true), 0, "chat")))
 	b := dnode("B", "e", er(routing.StrategyDeterministicPriority, 20, 2, model("pb", caps(true, false, false, true), 0, "chat")))
-	rt := newRouter(f, ps, "e", a, b)
+	rt := newRouter(f, ps, a, b)
 	_, res, _ := route(rt, textBody())
-	if res.ServedEndpoint != "B" || f.count("A") != 0 {
+	if res.ServedEndpoint != epid("B", "e") || f.count("A") != 0 {
 		t.Fatalf("full A should spill to B: served %q, A dials %d", res.ServedEndpoint, f.count("A"))
 	}
 }
@@ -206,10 +225,10 @@ func TestRoute_DeterministicPriority(t *testing.T) {
 	a := dnode("A", "e", er(routing.StrategyDeterministicPriority, 10, 0, model("pa", caps(true, false, false, true), 0, "chat")))
 	b := dnode("B", "e", er(routing.StrategyDeterministicPriority, 20, 0, model("pb", caps(true, false, false, true), 0, "chat")))
 	// Scheduler would prefer B, but deterministic priority must pick A.
-	rt := newRouter(f, routing.NewPools(), "e", a, b)
+	rt := newRouter(f, routing.NewPools(), a, b)
 	rt.SchedulerOrder = func() []string { return []string{"B", "A"} }
 	_, res, _ := route(rt, textBody())
-	if res.ServedEndpoint != "A" {
+	if res.ServedEndpoint != epid("A", "e") {
 		t.Fatalf("deterministic priority must pick A (10) over B (20); served %q", res.ServedEndpoint)
 	}
 }
@@ -219,10 +238,10 @@ func TestRoute_DefaultSchedulerOrder(t *testing.T) {
 	// Default strategy: scheduler order wins, priority is ignored.
 	a := dnode("A", "e", er(routing.StrategyDefault, 10, 0, model("pa", caps(true, false, false, true), 0, "chat")))
 	b := dnode("B", "e", er(routing.StrategyDefault, 99, 0, model("pb", caps(true, false, false, true), 0, "chat")))
-	rt := newRouter(f, routing.NewPools(), "e", a, b)
+	rt := newRouter(f, routing.NewPools(), a, b)
 	rt.SchedulerOrder = func() []string { return []string{"B", "A"} }
 	_, res, _ := route(rt, textBody())
-	if res.ServedEndpoint != "B" {
+	if res.ServedEndpoint != epid("B", "e") {
 		t.Fatalf("default strategy must follow scheduler order (B first); served %q", res.ServedEndpoint)
 	}
 }
@@ -231,7 +250,7 @@ func TestRoute_NoEligibleWritesLocalErrorNoUpstream(t *testing.T) {
 	f := &fakeRT{respond: rtOK(200, "SHOULD-NOT-BE-CALLED")}
 	// All nodes text-only; an image request has no eligible endpoint.
 	a := dnode("A", "e", er(routing.StrategyDeterministicPriority, 10, 0, model("pa", caps(true, false, false, true), 0, "chat")))
-	rt := newRouter(f, routing.NewPools(), "e", a)
+	rt := newRouter(f, routing.NewPools(), a)
 	handled, res, rec := route(rt, imageBody())
 	if !handled || !res.NoEligible {
 		t.Fatalf("no eligible endpoint should be handled locally: handled=%v res=%+v", handled, res)
@@ -247,7 +266,7 @@ func TestRoute_NoEligibleWritesLocalErrorNoUpstream(t *testing.T) {
 func TestRoute_UnhealthyExcluded(t *testing.T) {
 	f := &fakeRT{respond: rtOK(200, "ok")}
 	a := dnode("A", "e", er(routing.StrategyDeterministicPriority, 10, 0, model("pa", caps(true, false, false, true), 0, "chat")))
-	rt := newRouter(f, routing.NewPools(), "e", a)
+	rt := newRouter(f, routing.NewPools(), a)
 	rt.Healthy = func(noderec.DirectoryNode) bool { return false } // A is unhealthy
 	handled, res, _ := route(rt, textBody())
 	if !handled || !res.NoEligible || len(f.calls) != 0 {
@@ -261,9 +280,9 @@ func TestRoute_GenericRandomEngine(t *testing.T) {
 	const genericEngine = "engine-test-847291"
 	f := &fakeRT{respond: rtOK(200, "ok")}
 	n := dnode("N", genericEngine, er(routing.StrategyDeterministicPriority, 5, 0, model("strange-model-123", caps(true, false, true, true), 0, "local-coding")))
-	rt := newRouter(f, routing.NewPools(), genericEngine, n)
+	rt := newRouter(f, routing.NewPools(), n)
 	handled, res, _ := route(rt, `{"model":"local-coding","messages":[{"role":"user","content":"hi"}]}`)
-	if !handled || res.ServedEndpoint != "N" {
+	if !handled || res.ServedEndpoint != epid("N", genericEngine) {
 		t.Fatalf("generic engine must route via metadata alone: handled=%v served=%q", handled, res.ServedEndpoint)
 	}
 	got, _ := f.last("N")
@@ -279,16 +298,16 @@ func TestRoute_MultiModelPerEndpoint(t *testing.T) {
 		model("text-32k", caps(true, false, false, true), 32768, "fast"),
 		model("tools-262k", caps(true, false, true, true), 262144, "agent"),
 	))
-	rt := newRouter(f, routing.NewPools(), "e", n)
+	rt := newRouter(f, routing.NewPools(), n)
 
 	// tools request for the tools model -> served.
 	_, res, _ := route(rt, `{"model":"agent","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"f"}}]}`)
-	if res.ServedEndpoint != "A" {
+	if res.ServedEndpoint != epid("A", "e") {
 		t.Fatalf("tools request to the tools model should be served; %+v", res)
 	}
 	// tools request for the text model -> no eligible.
 	f2 := &fakeRT{respond: rtOK(200, "ok")}
-	rt2 := newRouter(f2, routing.NewPools(), "e", n)
+	rt2 := newRouter(f2, routing.NewPools(), n)
 	handled, res2, _ := route(rt2, `{"model":"fast","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"f"}}]}`)
 	if !handled || !res2.NoEligible || len(f2.calls) != 0 {
 		t.Fatalf("tools request to the non-tools model must be ineligible: res=%+v calls=%d", res2, len(f2.calls))

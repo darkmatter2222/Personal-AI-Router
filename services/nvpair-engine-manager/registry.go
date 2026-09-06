@@ -607,7 +607,41 @@ func (m *Manifest) Validate() error {
 			return fmt.Errorf("auth: %w", err)
 		}
 	}
+	// An external (adopt-only) engine may expose ONLY read-only actions: it must
+	// never spawn, stop, restart, reconfigure, install, uninstall or delete files.
+	// A non-read-only action on such an engine could never run past the runtime
+	// guard, so it is dead (or misleading) configuration — reject it at load
+	// rather than ship a contract the engine manager will always refuse.
+	if m.external() {
+		for name, a := range m.Actions {
+			if !a.ReadOnly {
+				return fmt.Errorf("action %q: an external (adopt-only) engine may declare only read_only actions", name)
+			}
+		}
+	}
 	return m.validatePlaceholders()
+}
+
+// runtimeExternal reports whether any platform declares the external (adopt-only)
+// runtime mode.
+func (m *Manifest) runtimeExternal() bool {
+	for _, p := range m.Platforms {
+		if p.Runtime.modeOrDefault() == "external" {
+			return true
+		}
+	}
+	return false
+}
+
+// external reports whether the engine is adopt-only, via either signal: an
+// external runtime mode, or a routing block that declares an external lifecycle.
+// The two are kept consistent so the lifecycle guard treats an external-runtime
+// engine as adopt-only even when it advertises no routing metadata.
+func (m *Manifest) external() bool {
+	if m.runtimeExternal() {
+		return true
+	}
+	return m.Routing != nil && m.Routing.External()
 }
 
 func (p *Platform) validate(key string) error {
@@ -620,8 +654,33 @@ func (p *Platform) validate(key string) error {
 		if len(p.Runtime.Start) == 0 {
 			return fmt.Errorf("platform %q: runtime.start is required in command mode", key)
 		}
+	case "external":
+		// Adopt-only: the engine is ALREADY running (e.g. "I have vLLM on port
+		// 8000; adopt it"). PAIR probes health, queries models and routes to it,
+		// but never spawns, stops, restarts, installs or uninstalls it. So a bin
+		// or start command is not required — and declaring one (or any lifecycle
+		// spec) is a contradiction that is rejected here rather than silently
+		// ignored. A known port is required because PAIR does not assign one.
+		if p.Runtime.Port <= 0 {
+			return fmt.Errorf("platform %q: runtime.port is required and must be > 0 in external mode (the already-running engine's port)", key)
+		}
+		if strings.TrimSpace(p.Runtime.Bin) != "" {
+			return fmt.Errorf("platform %q: runtime.bin must be empty in external mode (PAIR does not spawn an adopted engine)", key)
+		}
+		if len(p.Runtime.Start) != 0 {
+			return fmt.Errorf("platform %q: runtime.start is not allowed in external mode", key)
+		}
+		if p.Runtime.Stop != nil {
+			return fmt.Errorf("platform %q: runtime.stop is not allowed in external mode (PAIR must not stop an adopted engine)", key)
+		}
+		if p.Install != nil {
+			return fmt.Errorf("platform %q: install is not allowed in external mode (PAIR must not install an adopted engine)", key)
+		}
+		if p.Uninstall != nil {
+			return fmt.Errorf("platform %q: uninstall is not allowed in external mode (PAIR must not uninstall an adopted engine)", key)
+		}
 	default:
-		return fmt.Errorf("platform %q: runtime.mode %q invalid (want \"process\" or \"command\")", key, p.Runtime.Mode)
+		return fmt.Errorf("platform %q: runtime.mode %q invalid (want \"process\", \"command\" or \"external\")", key, p.Runtime.Mode)
 	}
 	if p.Install != nil {
 		if len(p.Install.Script) > 0 && (p.Install.Fetch != nil || len(p.Install.Run) > 0) {
@@ -689,6 +748,23 @@ func (a *Action) validate(name string) error {
 	}
 	if hasHTTP && (strings.TrimSpace(a.HTTP.Method) == "" || strings.TrimSpace(a.HTTP.Path) == "") {
 		return fmt.Errorf("action %q: http.method and http.path are required", name)
+	}
+	// Reject contradictory declarations early rather than trusting an impossible
+	// combination at runtime (Phase 10/33). read_only is an operator-declared
+	// promise that the action only OBSERVES the engine; a declaration that also
+	// mutates it (restart, filesystem delete) breaks that promise and must fail
+	// at load, not silently execute a mutation on an adopt-only engine.
+	if a.TimeoutMS < 0 {
+		return fmt.Errorf("action %q: timeout_ms must not be negative", name)
+	}
+	if a.ReadOnly && a.RestartAfter {
+		return fmt.Errorf("action %q: read_only is incompatible with restart_after (a restart mutates the engine lifecycle)", name)
+	}
+	if a.ReadOnly && hasRemovePath {
+		return fmt.Errorf("action %q: read_only is incompatible with remove_path (a filesystem delete is not read-only)", name)
+	}
+	if a.SlowLoad && !hasHTTP {
+		return fmt.Errorf("action %q: slow_load applies only to an http action (it selects the long response-header client)", name)
 	}
 	if a.Result != nil && (strings.TrimSpace(a.Result.Array) == "" || strings.TrimSpace(a.Result.Field) == "") {
 		return fmt.Errorf("action %q: result.array and result.field are required when result is set", name)

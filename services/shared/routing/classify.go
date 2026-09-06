@@ -5,8 +5,54 @@ package routing
 
 import (
 	"encoding/json"
+	"errors"
 	"unicode/utf8"
 )
+
+// ErrMalformedBody reports a non-empty request body that is not valid JSON for
+// any recognised request shape. It lets a caller distinguish a client error (the
+// request cannot be parsed, so it should get a 400 Bad Request) from a routing
+// failure (the request is well-formed but no endpoint can serve it, a 503). An
+// empty body is NOT malformed: it simply yields empty Requirements.
+var ErrMalformedBody = errors.New("routing: malformed request body")
+
+// ReservePolicy configures the conservative context reserves Classify adds when
+// estimating RequiredContext. The zero value means "use the built-in defaults",
+// so existing callers are unaffected. It exists because one universal output
+// reserve is wrong for every deployment: a coding environment whose models emit
+// long completions should be able to raise the output reserve far above the
+// 512-token default without editing the routing core.
+type ReservePolicy struct {
+	// OutputReserveTokens is the output allowance added when a request does not
+	// specify a maximum output length. A value <= 0 uses DefaultOutputReserveTokens.
+	OutputReserveTokens int
+	// ImageReserveTokensPerImage is the per-image context allowance. A value <= 0
+	// uses DefaultImageTokenReservePerImage.
+	ImageReserveTokensPerImage int
+}
+
+// outputReserve resolves the effective output reserve, saturating at the token
+// cap so a pathological configuration cannot overflow the context arithmetic.
+func (p ReservePolicy) outputReserve() int {
+	if p.OutputReserveTokens > 0 {
+		if p.OutputReserveTokens > maxTokenEstimate {
+			return maxTokenEstimate
+		}
+		return p.OutputReserveTokens
+	}
+	return DefaultOutputReserveTokens
+}
+
+// imageReserve resolves the effective per-image reserve, saturating at the cap.
+func (p ReservePolicy) imageReserve() int {
+	if p.ImageReserveTokensPerImage > 0 {
+		if p.ImageReserveTokensPerImage > maxTokenEstimate {
+			return maxTokenEstimate
+		}
+		return p.ImageReserveTokensPerImage
+	}
+	return DefaultImageTokenReservePerImage
+}
 
 // Requirements is the routing-relevant summary of a request. It contains only
 // metadata used for eligibility and admission — never the request's actual
@@ -156,24 +202,36 @@ type rawMessage struct {
 	ToolCalls []json.RawMessage `json:"tool_calls"`
 }
 
-// Classify extracts routing Requirements from a raw request body. It never
-// panics: a nil, empty, malformed or unexpectedly-shaped body yields a
-// zero-value Requirements (plus whatever fields did parse). It handles the
-// OpenAI chat and completions shapes and the Ollama generate and chat shapes in
-// a single pass, including string content, structured content blocks, every
-// supported image form, tools/functions, streaming and the output-length
-// fields.
+// Classify extracts routing Requirements from a raw request body using the
+// default reserve policy. It never panics and never reports malformed input: a
+// nil, empty, malformed or unexpectedly-shaped body yields a zero-value
+// Requirements (plus whatever fields did parse). It is retained for callers that
+// cannot act on a client error; new callers on a request path that can return a
+// status should prefer ClassifyRequest, which surfaces ErrMalformedBody so a
+// malformed request becomes a 400 rather than a routing 503.
 func Classify(body []byte) Requirements {
+	req, _ := ClassifyRequest(body, ReservePolicy{})
+	return req
+}
+
+// ClassifyRequest extracts routing Requirements under an explicit reserve policy
+// and reports whether the body was parseable. It handles the OpenAI chat and
+// completions shapes and the Ollama generate and chat shapes in a single pass,
+// including string content, structured content blocks, every supported image
+// form, tools/functions, streaming and the output-length fields.
+//
+// It returns ErrMalformedBody (with zero Requirements) when a non-empty body is
+// not valid JSON for any recognised shape, so a request path can answer 400
+// instead of forwarding unparseable bytes or collapsing into a false
+// MODEL_NOT_AVAILABLE. An empty body is valid and yields empty Requirements.
+func ClassifyRequest(body []byte, policy ReservePolicy) (Requirements, error) {
 	var req Requirements
 	if len(body) == 0 {
-		return req
+		return req, nil
 	}
 	var r rawRequest
 	if err := json.Unmarshal(body, &r); err != nil {
-		// A malformed body is not fatal to routing: we simply learn nothing from
-		// it. The caller still has the requested model from its own path parsing
-		// if it needs one.
-		return req
+		return req, ErrMalformedBody
 	}
 
 	req.Model = r.Model
@@ -232,15 +290,15 @@ func Classify(body []byte) Requirements {
 	// negative value.
 	effectiveOutput := req.OutputTokensReq
 	if effectiveOutput <= 0 {
-		effectiveOutput = DefaultOutputReserveTokens
+		effectiveOutput = policy.outputReserve()
 	}
-	imageReserve := satMul(req.ImageCount, DefaultImageTokenReservePerImage)
+	imageReserve := satMul(req.ImageCount, policy.imageReserve())
 	conversation := satAdd(satAdd(req.InputTokensEst, effectiveOutput), imageReserve)
 	req.RequiredContext = conversation
 	if req.RequestedContext > req.RequiredContext {
 		req.RequiredContext = req.RequestedContext
 	}
-	return req
+	return req, nil
 }
 
 // resolveRequestedContext extracts an explicitly requested context-window size

@@ -10,13 +10,18 @@ import "sort"
 // name to rewrite the request to, the API family, the admission capacity and
 // the per-endpoint timeout profile.
 type Placement struct {
+	// EndpointID is the unique deployment identity: it keys the admission pool,
+	// the deterministic tie-break and target resolution.
 	EndpointID string
-	Engine     string
-	Physical   string
-	APIFamily  APIFamily
-	Priority   int
-	Capacity   int
-	Timeouts   Timeouts
+	// NodeID is the owning PAIR host identity: it is the default strategy's
+	// ranking key, so two endpoints on the same node share a scheduler rank.
+	NodeID    string
+	Engine    string
+	Physical  string
+	APIFamily APIFamily
+	Priority  int
+	Capacity  int
+	Timeouts  Timeouts
 }
 
 // Rejection records why one endpoint was excluded, using a stable reason code.
@@ -55,6 +60,10 @@ func (d Decision) Selected() (Placement, bool) {
 // otherwise it uses the default (scheduler) ordering. This is a single,
 // deterministic rule — the two strategies never run in sequence and never
 // reorder one another.
+//
+// Callers MUST resolve strategy from the ELIGIBLE endpoints only (see
+// DecideResolved). Resolving over the full input would let an endpoint that
+// cannot serve the request dictate the ordering policy for the ones that can.
 func ResolveStrategy(endpoints []Endpoint) Strategy {
 	for _, e := range endpoints {
 		if e.Strategy == StrategyDeterministicPriority {
@@ -62,6 +71,34 @@ func ResolveStrategy(endpoints []Endpoint) Strategy {
 		}
 	}
 	return StrategyDefault
+}
+
+// DecideResolved runs the full routing pipeline with the strategy resolved from
+// the ELIGIBLE endpoints only, then orders. This is the entry point the proxy
+// route-adapter uses.
+//
+// The two-pass shape is deliberate and fixes a real ordering bug (Phase 8): an
+// endpoint that declares StrategyDeterministicPriority but cannot serve the
+// request (wrong model, missing capability, unhealthy, draining, over context)
+// must NOT force the eligible endpoints into deterministic ordering. So this
+// function evaluates eligibility first, resolves the strategy from the survivors
+// only, and delegates ordering to Decide. Eligibility is evaluated twice (here
+// and inside Decide); Evaluate is a pure, allocation-light function and the
+// candidate count is small, so the clarity is worth the second pass.
+//
+// When eligible endpoints disagree on strategy the "deterministic dominates"
+// rule of ResolveStrategy applies. That is the documented contract for a mixed
+// eligible set; operators who want to forbid mixed policy within one logical
+// routing group should reject it at configuration time (see Validate), not rely
+// on ordering to paper over an inconsistent contract.
+func DecideResolved(req Requirements, endpoints []Endpoint, defaultOrder []string) Decision {
+	eligible := make([]Endpoint, 0, len(endpoints))
+	for _, e := range endpoints {
+		if Evaluate(req, e).OK {
+			eligible = append(eligible, e)
+		}
+	}
+	return Decide(req, endpoints, ResolveStrategy(eligible), defaultOrder)
 }
 
 // Decide evaluates every endpoint's eligibility, then orders the survivors by
@@ -97,6 +134,7 @@ func Decide(req Requirements, endpoints []Endpoint, strategy Strategy, defaultOr
 		}
 		d.Ordered = append(d.Ordered, Placement{
 			EndpointID: e.ID,
+			NodeID:     e.NodeID,
 			Engine:     e.Engine,
 			Physical:   el.Model.Physical,
 			APIFamily:  e.APIFamily,
@@ -129,8 +167,18 @@ func Decide(req Requirements, endpoints []Endpoint, strategy Strategy, defaultOr
 			}
 			return absent
 		}
+		// The default strategy ranks by NODE identity: the scheduler orders nodes,
+		// so two endpoints hosted on one node share a rank and the EndpointID
+		// tie-break then orders them. NodeID falls back to EndpointID when unset,
+		// which preserves single-endpoint (node == endpoint) callers.
+		rankKey := func(p Placement) string {
+			if p.NodeID != "" {
+				return p.NodeID
+			}
+			return p.EndpointID
+		}
 		sort.SliceStable(d.Ordered, func(i, j int) bool {
-			ri, rj := rankOf(d.Ordered[i].EndpointID), rankOf(d.Ordered[j].EndpointID)
+			ri, rj := rankOf(rankKey(d.Ordered[i])), rankOf(rankKey(d.Ordered[j]))
 			if ri != rj {
 				return ri < rj
 			}

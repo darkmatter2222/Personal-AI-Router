@@ -229,3 +229,108 @@ dedicated install UX) from an open `EngineId` (identity, inventory, workloads).
 A future runtime that does not exist today survives manifest → registry →
 inventory → routing metadata → discovery → scheduler → desktop state without any
 new entry in a compiled source enumeration.
+
+## Cross-engine routing (one alias, many engines)
+
+Engine identity does **not** define the routing universe. One logical request
+(say model `local-coding`) considers candidate endpoints across **every** engine
+a node declares, regardless of whether the runtime is named `vllm`, `llamacpp`,
+`sglang`, `custom-engine-123` or a runtime that does not exist yet. The
+`routeadapter.Router` is engine-agnostic: it materialises a candidate for every
+`(node, engine)` pair whose declared contract matches, then the ordinary
+eligibility gates (API family, model/alias, capabilities, context, state) and the
+routing policy decide the winner. An optional `EngineFilter` narrows the engine
+set only where a surface genuinely needs it; the generic OpenAI-compatible path
+uses no filter.
+
+The upshot is a request for `local-coding` can resolve to `qwen-fast` on a vLLM
+node, `qwen-q4` on a llama.cpp node, or `flash-next` on a custom VLM node, purely
+from declared metadata, and each outbound request carries **that endpoint's own
+physical model name**. Capability, context, admission, failover, timeout
+isolation and model rewriting all apply across engine ids uniformly.
+
+## Node and endpoint identity
+
+Two identities are kept distinct:
+
+- **NodeID** is the stable PAIR host identity (the host UUID). It is the default
+  strategy's scheduler-ranking key, so two engines hosted on one node share a
+  rank.
+- **EndpointID** is the unique deployment identity for one `(node, engine)`
+  runtime. It keys the admission pool, the deterministic tie-break, and target
+  resolution. It is built with a collision-free key builder (`routing.EndpointKey`,
+  a NUL-joined `(node, engine[, ordinal])`), so a node hosting several engines
+  yields several endpoints that admit and fail over independently while sharing
+  one scheduler rank. When a caller supplies no NodeID, ranking falls back to the
+  EndpointID, preserving single-endpoint behaviour.
+
+## Mixed legacy/enhanced clusters (rolling upgrade)
+
+If **no** node advertises routing metadata for the filtered engine set, the
+adapter declines (`handled=false`) and the proxy uses its existing legacy path;
+the request body is preserved byte-for-byte. If **at least one** node is enhanced,
+a legacy node does not disappear: the adapter synthesises a conservative
+candidate from that node's advertised inventory (`ModelsByEngine`) — text and
+streaming only, unbounded capacity, unknown context, default strategy, physical
+== inventory model. It never **invents** vision or tools support, so
+capability-specific traffic is safely excluded from a legacy node rather than
+routed to it on a guess. An enhanced engine that declares routing metadata but an
+empty `Models` list falls back to its inventory the same conservative way.
+
+## External / adopt-only runtime mode
+
+A manifest may declare `runtime.mode = "external"` to adopt an
+already-running engine (for example "I have vLLM on port 8000; adopt it"). In
+external mode PAIR probes health, queries models, routes inference and reports
+status, but never spawns, stops, restarts, installs, uninstalls or reconfigures
+the engine. Validation enforces this: external mode requires a known port and
+forbids `bin`, `start`, `stop`, `install` and `uninstall`; an external engine may
+declare only `read_only` actions. The lifecycle guard treats an external-runtime
+engine as adopt-only even when it advertises no routing block, so the guard
+cannot be bypassed by omitting routing metadata. The backend host is operator
+configuration, never client input, and defaults to loopback.
+
+## Configurable context reserves
+
+The conservative context estimate adds an output reserve (when the request
+specifies no output length) and a per-image reserve. These default to 512 and
+1024 tokens but are configurable per router via `routing.ReservePolicy`, so a
+deployment whose models emit long completions can raise the output reserve well
+above 512 without editing the routing core.
+
+## Request validation: client errors vs routing failures
+
+The adapter distinguishes a **client error** from a **routing failure**:
+
+- A body larger than the configured maximum returns **413** without contacting a
+  backend and without truncating the request. Oversize is detected by reading one
+  byte past the limit (and by a declared `Content-Length`), never by silently
+  truncating.
+- A body read error returns **400**; a partial body is never forwarded.
+- Malformed JSON returns **400**, not a routing **503** — a request that cannot be
+  parsed is a client problem, not "no eligible endpoint". An empty body is valid
+  and simply carries no model.
+
+## Owner-side authoritative admission
+
+Remote capacity information is inherently stale, so the node that owns a backend
+re-enforces capacity at ingress with its own `routing.Pools.Reserve(endpointID,
+capacity)` before forwarding to its local engine. If full, it returns a
+machine-readable capacity response before contacting the backend, so the
+initiating node can still fail over while the response is pre-commit. The
+reservation is authoritative and concurrency-safe: under many concurrent
+initiators the number admitted at any instant never exceeds the declared
+capacity.
+
+## Proxy integration status
+
+The shared pipeline lives in `services/shared/routing` (pure decision + forward)
+and `services/shared/routeadapter` (the request-path glue: classify → decide →
+reserve → forward, wired to a proxy's cached state via injected providers). The
+adapter is fully component-tested in-process with fakes. Wiring it into the live
+`ollama-proxy` / `lmstudio-proxy` request handlers is the remaining integration
+step; it is intentionally applied and compiled on a machine with the Go toolchain
+rather than blind, because the proxies' live inference path (cluster mTLS,
+reachability-tracked targets, per-peer transports, scheduler baseline) must not be
+edited unverified. Until that wiring lands, the proxies keep their existing
+behaviour unchanged.
