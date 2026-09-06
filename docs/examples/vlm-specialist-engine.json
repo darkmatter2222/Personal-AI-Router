@@ -1,0 +1,41 @@
+{
+  "engine": "vlm-specialist",
+  "display_name": "Vision-Language Specialist",
+  "manifest_version": 1,
+  "platforms": {
+    "linux/amd64": {
+      "detect": ["{install_dir}/bin/vlm-server"],
+      "runtime": {
+        "bin": "{install_dir}/bin/vlm-server",
+        "bind": "0.0.0.0",
+        "port": 8100,
+        "health": { "http": "http://127.0.0.1:{port}/health", "status": 200, "interval_s": 10 }
+      }
+    }
+  },
+  "routing": {
+    "apiFamily": "openai",
+    "lifecycle": "external",
+    "strategy": "deterministic-priority",
+    "priority": 30,
+    "capacity": 1,
+    "timeouts": { "connectMs": 250, "responseHeaderMs": 30000, "firstByteMs": 120000 },
+    "health": { "path": "/health" },
+    "models": [
+      {
+        "physical": "vlm-large",
+        "aliases": ["local-vision"],
+        "capabilities": { "text": true, "vision": true, "tools": false, "streaming": true },
+        "context": { "maxTokens": 131072 }
+      }
+    ]
+  },
+  "actions": {
+    "list_models": {
+      "description": "List models the VLM serves (OpenAI /v1/models).",
+      "http": { "method": "GET", "path": "/v1/models" },
+      "result": { "array": "data", "field": "id" },
+      "read_only": true
+    }
+  }
+}

@@ -4,40 +4,45 @@
 <#
 .SYNOPSIS
   Deterministic, offline, unattended validation for the heterogeneous
-  capability-aware routing work.
+  capability-aware routing work, with two modes.
+
+.PARAMETER Mode
+  Developer (default) — skips are allowed and clearly reported; the script exits
+    nonzero only when a check that RAN failed. Useful on a box without the full
+    toolchain.
+  Readiness — every mandatory check MUST execute and pass. A missing Go
+    toolchain, a skipped required suite, an unavailable race detector, or
+    sub-threshold routing coverage all FAIL. This is the gate for declaring the
+    branch READY FOR REAL-BACKEND INTEGRATION TESTING.
 
 .DESCRIPTION
-  This script runs ONLY the safe, deterministic unit/component tests for the
-  heterogeneous routing feature. It is designed to be run unattended with no
-  network, no installs, and no chance of launching a real engine or the full
-  PAIR system.
-
-  Guarantees / non-goals (by construction):
-    * Installs nothing (no go get / npm install / winget / choco).
-    * Touches no network: Go module access is forced offline (GOPROXY=off).
-    * Launches no inference engine, no service binary, and no full deployment.
-    * Runs NO cross-process integration tests: it never runs `go test ./...`,
-      never touches services/tests, and never uses `-tags live`. It runs an
+  Guarantees in BOTH modes (by construction):
+    * Installs nothing (no go get / npm install / winget / choco). A missing
+      toolchain FAILS with "REQUIRED TOOLCHAIN MISSING" rather than fetching it.
+    * Touches no network (GOPROXY=off).
+    * Launches no inference engine, service binary, or full deployment.
+    * Runs NO cross-process integration tests: never `go test ./...` at the
+      services root, never services/tests, never `-tags live`. It runs an
       explicit allowlist of pure/unit packages only.
     * Requires no interaction.
 
-  Exit codes:
-    0  every check that could run passed (checks whose toolchain is absent are
-       reported as SKIPPED, which is not a failure on an offline machine).
-    1  a check that ran FAILED (a real test failure or a format violation).
-
-  It is safe to run on a developer box too: there it actually executes the Go
-  and desktop suites; on a toolchain-less machine it reports each as SKIPPED.
+  Exit 0 = success for the selected mode. Exit 1 = failure.
 #>
+
+param(
+    [ValidateSet('Developer', 'Readiness')]
+    [string]$Mode = 'Developer'
+)
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-# Force offline behavior for every child process this script spawns. These are
-# process-scoped only; no global configuration is modified.
-$env:GOFLAGS   = '-mod=mod'
-$env:GOPROXY   = 'off'
-$env:GOSUMDB   = 'off'
+$Readiness = ($Mode -eq 'Readiness')
+
+# Force offline behavior for every child process (process-scoped only).
+$env:GOFLAGS = '-mod=mod'
+$env:GOPROXY = 'off'
+$env:GOSUMDB = 'off'
 $env:GOTOOLCHAIN = 'local'
 $env:HF_HUB_OFFLINE = '1'
 $env:TRANSFORMERS_OFFLINE = '1'
@@ -49,27 +54,36 @@ $RepoRoot = Split-Path -Parent $PSScriptRoot
 $Services = Join-Path $RepoRoot 'services'
 $Desktop  = Join-Path $RepoRoot 'desktop'
 
+# Routing statement-coverage gate (Readiness mode).
+$RoutingCoverageMin = 98.0
+
 $script:Failures = 0
-$script:Ran      = 0
-$script:Skipped  = 0
+$script:Ran = 0
+$script:Skipped = 0
 
-function Section($name) { Write-Host ""; Write-Host "==== $name ====" -ForegroundColor Cyan }
-function Skip($msg)     { Write-Host "SKIPPED: $msg" -ForegroundColor Yellow; $script:Skipped++ }
-function Pass($msg)     { Write-Host "PASS: $msg" -ForegroundColor Green; $script:Ran++ }
-function Fail($msg)     { Write-Host "FAIL: $msg" -ForegroundColor Red; $script:Failures++; $script:Ran++ }
+function Section($n) { Write-Host ""; Write-Host "==== $n ($Mode mode) ====" -ForegroundColor Cyan }
+function Pass($m) { Write-Host "PASS: $m" -ForegroundColor Green; $script:Ran++ }
+function Fail($m) { Write-Host "FAIL: $m" -ForegroundColor Red; $script:Failures++; $script:Ran++ }
+function Have($c) { return [bool](Get-Command $c -ErrorAction SilentlyContinue) }
 
-function Have($cmd) { return [bool](Get-Command $cmd -ErrorAction SilentlyContinue) }
+# Skip: in Developer mode it is a reported non-failure; in Readiness mode a skip
+# of a MANDATORY check is a failure.
+function SkipOrFail($m, [bool]$Mandatory = $true) {
+    if ($Readiness -and $Mandatory) {
+        Fail "REQUIRED CHECK NOT EXECUTED: $m"
+    } else {
+        Write-Host "SKIPPED: $m" -ForegroundColor Yellow
+        $script:Skipped++
+    }
+}
 
-# Run `go test` for an explicit, safe package list inside one module directory.
 function Go-Test($moduleDir, [string[]]$packages, $label) {
     Push-Location $moduleDir
     try {
         Write-Host "> (cd $moduleDir) go test $($packages -join ' ')"
         & go test @packages
         if ($LASTEXITCODE -eq 0) { Pass $label } else { Fail "$label (go test exit $LASTEXITCODE)" }
-    } finally {
-        Pop-Location
-    }
+    } finally { Pop-Location }
 }
 
 Section "Toolchain detection"
@@ -77,36 +91,35 @@ $HasGo = Have 'go'
 $HasGofmt = Have 'gofmt'
 $HasNode = Have 'node'
 $HasNodeModules = Test-Path (Join-Path $Desktop 'node_modules')
-Write-Host "go:            $HasGo"
-Write-Host "gofmt:         $HasGofmt"
-Write-Host "node:          $HasNode"
-Write-Host "node_modules:  $HasNodeModules"
+Write-Host "go=$HasGo gofmt=$HasGofmt node=$HasNode node_modules=$HasNodeModules"
 
-# ---- Go: gofmt (format) on the routing package only -------------------------
+if ($Readiness -and -not $HasGo) {
+    Write-Host ""
+    Write-Host "REQUIRED TOOLCHAIN MISSING: Go is not on PATH. Readiness mode cannot" -ForegroundColor Red
+    Write-Host "install it (offline) and cannot pass without executing the Go suites." -ForegroundColor Red
+    Write-Host "RESULT: FAIL" -ForegroundColor Red
+    exit 1
+}
+
+# ---- gofmt (routing package) ------------------------------------------------
 Section "gofmt (routing package)"
 if ($HasGofmt) {
-    $routingDir = Join-Path $Services 'shared/routing'
-    $bad = & gofmt -l $routingDir
-    if ([string]::IsNullOrWhiteSpace($bad)) { Pass "routing gofmt clean" }
-    else { Fail "gofmt found unformatted files:`n$bad" }
+    $bad = & gofmt -l (Join-Path $Services 'shared/routing')
+    if ([string]::IsNullOrWhiteSpace($bad)) { Pass "routing gofmt clean" } else { Fail "gofmt unformatted:`n$bad" }
 } else {
-    Skip "gofmt not on PATH"
+    SkipOrFail "gofmt not on PATH" $true
 }
 
-# ---- Go: safe unit/component test allowlist ---------------------------------
-# ONLY pure/unit packages. Never `./...` at the services root, never
-# services/tests, never -tags live.
+# ---- Go unit/component tests (explicit safe allowlist) ----------------------
 Section "Go unit/component tests (allowlist)"
 if ($HasGo) {
-    # The new shared routing package is stdlib-only and fully self-contained.
-    Go-Test (Join-Path $Services 'shared') @('./routing/...','./noderec/...','./schedulerwire/...') 'shared routing/noderec/schedulerwire'
-    # Job scheduler: schedule_test.go + telemetry_test.go are pure in-memory.
+    Go-Test (Join-Path $Services 'shared') @('./routing/...','./routeadapter/...','./noderec/...','./schedulerwire/...') 'shared routing/routeadapter/noderec/schedulerwire'
     Go-Test (Join-Path $Services 'nvpair-job-scheduler') @('./...') 'nvpair-job-scheduler'
 } else {
-    Skip "go not on PATH — Go tests not executed (documented offline limitation)"
+    SkipOrFail "go not on PATH — Go unit tests not executed" $true
 }
 
-# ---- Go: race detector on the routing package (best effort) -----------------
+# ---- Race detector (routing package) ----------------------------------------
 Section "Go race detector (routing package)"
 if ($HasGo) {
     Push-Location (Join-Path $Services 'shared')
@@ -114,46 +127,78 @@ if ($HasGo) {
         Write-Host "> go test -race ./routing/..."
         & go test -race ./routing/...
         if ($LASTEXITCODE -eq 0) { Pass "routing -race" }
-        else { Fail "routing -race (exit $LASTEXITCODE)" }
-    } catch {
-        Skip "race detector unavailable (needs cgo/gcc): $($_.Exception.Message)"
-    } finally {
-        Pop-Location
-    }
+        else { Fail "routing -race (exit $LASTEXITCODE; needs a working cgo/C toolchain)" }
+    } finally { Pop-Location }
 } else {
-    Skip "go not on PATH — race tests not executed"
+    SkipOrFail "go not on PATH — race tests not executed" $true
 }
 
-# ---- Desktop: typecheck + unit tests (only if deps already present) ---------
+# ---- Coverage gate (routing package) ----------------------------------------
+Section "Go coverage (routing package, min $RoutingCoverageMin`%)"
+if ($HasGo) {
+    Push-Location (Join-Path $Services 'shared')
+    try {
+        $cover = Join-Path ([System.IO.Path]::GetTempPath()) 'pair-routing-cover.out'
+        Write-Host "> go test -coverprofile routing coverage"
+        & go test -coverprofile="$cover" ./routing/...
+        if ($LASTEXITCODE -ne 0) {
+            Fail "coverage run failed (exit $LASTEXITCODE)"
+        } else {
+            $func = & go tool cover -func="$cover"
+            $totalLine = $func | Where-Object { $_ -match 'total:' } | Select-Object -Last 1
+            if ($totalLine -match '([\d.]+)%') {
+                $pct = [double]$Matches[1]
+                Write-Host "routing total coverage: $pct`%"
+                if ($pct -ge $RoutingCoverageMin) { Pass "routing coverage $pct% >= $RoutingCoverageMin%" }
+                else { Fail "routing coverage $pct% < $RoutingCoverageMin%" }
+            } else {
+                Fail "could not parse routing coverage total"
+            }
+            Remove-Item $cover -ErrorAction SilentlyContinue
+        }
+    } finally { Pop-Location }
+} else {
+    SkipOrFail "go not on PATH — coverage not measured" $true
+}
+
+# ---- Desktop typecheck + unit tests -----------------------------------------
 Section "Desktop typecheck + unit tests"
 if ($HasNode -and $HasNodeModules) {
     Push-Location $Desktop
     try {
-        Write-Host "> npm run typecheck"
-        & npm run typecheck
+        Write-Host "> npm run typecheck"; & npm run typecheck
         if ($LASTEXITCODE -eq 0) { Pass "desktop typecheck" } else { Fail "desktop typecheck (exit $LASTEXITCODE)" }
-        Write-Host "> npm run test:unit"
-        & npm run test:unit
+        Write-Host "> npm run test:unit"; & npm run test:unit
         if ($LASTEXITCODE -eq 0) { Pass "desktop test:unit" } else { Fail "desktop test:unit (exit $LASTEXITCODE)" }
-    } finally {
-        Pop-Location
-    }
-} elseif ($HasNode) {
-    Skip "desktop/node_modules absent — not installing (offline). Desktop tests not executed."
+    } finally { Pop-Location }
 } else {
-    Skip "node not on PATH — desktop tests not executed"
+    # Desktop deps are only mandatory in Readiness mode IF desktop sources changed.
+    $desktopChanged = $false
+    if (Have 'git') {
+        Push-Location $RepoRoot
+        try { $desktopChanged = [bool]((& git diff --name-only main...HEAD 2>$null) | Where-Object { $_ -like 'desktop/*' }) } catch {} finally { Pop-Location }
+    }
+    SkipOrFail "desktop/node_modules absent (not installing offline) — desktop tests not executed" $desktopChanged
 }
 
 # ---- Summary ----------------------------------------------------------------
 Section "Summary"
-Write-Host "ran=$($script:Ran)  failures=$($script:Failures)  skipped=$($script:Skipped)"
+Write-Host "ran=$($script:Ran) failures=$($script:Failures) skipped=$($script:Skipped)"
 if ($script:Failures -gt 0) {
     Write-Host "RESULT: FAIL" -ForegroundColor Red
     exit 1
 }
-if ($script:Ran -eq 0) {
-    Write-Host "RESULT: NO CHECKS EXECUTED (all toolchains unavailable offline). Nothing failed, but nothing was proven." -ForegroundColor Yellow
+if ($Readiness) {
+    if ($script:Skipped -gt 0) {
+        Write-Host "RESULT: FAIL (readiness mode: $($script:Skipped) mandatory check(s) skipped)" -ForegroundColor Red
+        exit 1
+    }
+    Write-Host "RESULT: PASS (readiness)" -ForegroundColor Green
     exit 0
 }
-Write-Host "RESULT: PASS" -ForegroundColor Green
+if ($script:Ran -eq 0) {
+    Write-Host "RESULT: NO CHECKS EXECUTED (toolchains unavailable). Nothing failed, nothing proven." -ForegroundColor Yellow
+    exit 0
+}
+Write-Host "RESULT: PASS (developer)" -ForegroundColor Green
 exit 0

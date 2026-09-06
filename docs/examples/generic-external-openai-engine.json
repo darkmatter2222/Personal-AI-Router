@@ -1,0 +1,46 @@
+{
+  "engine": "custom-openai-runtime",
+  "display_name": "Custom OpenAI-Compatible Runtime",
+  "manifest_version": 1,
+  "platforms": {
+    "linux/amd64": {
+      "detect": ["{install_dir}/bin/custom-runtime"],
+      "runtime": {
+        "bin": "{install_dir}/bin/custom-runtime",
+        "bind": "0.0.0.0",
+        "port": 8000,
+        "health": { "http": "http://127.0.0.1:{port}/health", "status": 200, "interval_s": 10 }
+      }
+    }
+  },
+  "routing": {
+    "apiFamily": "openai",
+    "lifecycle": "external",
+    "strategy": "deterministic-priority",
+    "priority": 10,
+    "capacity": 2,
+    "timeouts": { "connectMs": 250, "responseHeaderMs": 30000, "firstByteMs": 30000 },
+    "health": { "path": "/health" },
+    "models": [
+      {
+        "physical": "actual-upstream-model",
+        "aliases": ["local-coding"],
+        "capabilities": { "text": true, "vision": false, "tools": true, "streaming": true },
+        "context": { "maxTokens": 262144 }
+      }
+    ]
+  },
+  "auth": {
+    "headers": [
+      { "name": "Authorization", "valueEnv": "PAIR_TEST_BACKEND_TOKEN" }
+    ]
+  },
+  "actions": {
+    "list_models": {
+      "description": "List models the runtime serves (OpenAI /v1/models).",
+      "http": { "method": "GET", "path": "/v1/models" },
+      "result": { "array": "data", "field": "id" },
+      "read_only": true
+    }
+  }
+}
