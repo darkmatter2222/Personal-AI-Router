@@ -5,12 +5,14 @@ package main
 
 import (
 	"log/slog"
+	"reflect"
 	"sort"
 	"sync"
 	"time"
 
 	"nvpair-shared/netpick"
 	"nvpair-shared/noderec"
+	"nvpair-shared/routing"
 )
 
 // toDirectoryNode converts a browsed _nvpair-node instance into a directory entry
@@ -241,7 +243,7 @@ func (d *directory) snapshot(filter noderec.ServiceKey) []noderec.DirectoryNode 
 // Returns the (possibly updated) node, whether the inventory changed, and
 // whether the guarded apply was valid. ok == false means the result is stale
 // (node gone or re-addressed) and the caller must not cache or emit it.
-func (d *directory) applyModels(hostUUID, ip string, emPort int, models []string, byEngine, loadedByEngine map[string][]string) (node noderec.DirectoryNode, changed, ok bool) {
+func (d *directory) applyModels(hostUUID, ip string, emPort int, models []string, byEngine, loadedByEngine map[string][]string, routingByEngine map[string]routing.EngineRouting) (node noderec.DirectoryNode, changed, ok bool) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	n, present := d.nodes[hostUUID]
@@ -252,12 +254,14 @@ func (d *directory) applyModels(hostUUID, ip string, emPort int, models []string
 	if !has || n.IP != ip || em.Port != emPort {
 		return n, false, false
 	}
-	if sameStringSet(n.Models, models) && sameByEngine(n.ModelsByEngine, byEngine) && sameByEngine(n.LoadedByEngine, loadedByEngine) {
+	if sameStringSet(n.Models, models) && sameByEngine(n.ModelsByEngine, byEngine) &&
+		sameByEngine(n.LoadedByEngine, loadedByEngine) && sameRoutingByEngine(n.RoutingByEngine, routingByEngine) {
 		return n, false, true
 	}
 	n.Models = models
 	n.ModelsByEngine = byEngine
 	n.LoadedByEngine = loadedByEngine
+	n.RoutingByEngine = routingByEngine
 	d.nodes[hostUUID] = n
 	return n, true, true
 }
@@ -305,6 +309,15 @@ func (d *directory) applyClusterIdentity(hostUUID string, clusterUUID *string, t
 	n.Trusted = trusted
 	d.nodes[hostUUID] = n
 	return n, true
+}
+
+// sameRoutingByEngine reports whether two per-engine routing-metadata maps are
+// equal. routing.EngineRouting contains slices and a pointer, so it is not
+// comparable with ==; a deep comparison is used purely for change detection (a
+// false negative only causes a harmless redundant directory update, never wrong
+// data).
+func sameRoutingByEngine(a, b map[string]routing.EngineRouting) bool {
+	return reflect.DeepEqual(a, b)
 }
 
 // sameByEngine reports whether two per-engine model maps are semantically equal:

@@ -17,6 +17,7 @@ import (
 	"nvpair-shared/applog"
 	"nvpair-shared/netpick"
 	"nvpair-shared/noderec"
+	"nvpair-shared/routing"
 
 	"nvpair-ui-broker/relay"
 )
@@ -71,6 +72,12 @@ type EnrichedNode struct {
 	// peer's engine-manager /v1/models loadedByEngine field. Carried through to
 	// AvailableNode so a remote node's cards can reflect loaded state.
 	LoadedByEngine map[string][]string `json:"loadedByEngine,omitempty"`
+	// RoutingByEngine carries per-engine capability-aware routing metadata, keyed
+	// by engine-manager engine name, enriched by the daemon from the peer's
+	// engine-manager /v1/models routingByEngine field. It is credential-free
+	// (backend auth is node-local) and carried through to AvailableNode so a
+	// consumer can reason about an engine's declared routing contract.
+	RoutingByEngine map[string]routing.EngineRouting `json:"routingByEngine,omitempty"`
 }
 
 // directoryToEnriched projects the promoted daemon's DirectoryNode onto the
@@ -106,9 +113,10 @@ func directoryToEnriched(n noderec.DirectoryNode) EnrichedNode {
 		Memory:         n.Memory,
 		Trusted:        n.Trusted,
 		Clustered:      n.Clustered(),
-		Models:         n.Models,
-		ModelsByEngine: n.ModelsByEngine,
-		LoadedByEngine: n.LoadedByEngine,
+		Models:          n.Models,
+		ModelsByEngine:   n.ModelsByEngine,
+		LoadedByEngine:   n.LoadedByEngine,
+		RoutingByEngine:  n.RoutingByEngine,
 	}
 }
 
@@ -318,11 +326,12 @@ func (sn storedNode) toAvailable() AvailableNode {
 		IPAddresses:    candidates,
 		Port:           n.Port,
 		LastSeen:       sn.lastSeen.Unix(),
-		Trusted:        n.Trusted,
-		Clustered:      n.Clustered,
-		Models:         n.Models,
-		ModelsByEngine: n.ModelsByEngine,
-		LoadedByEngine: n.LoadedByEngine,
+		Trusted:         n.Trusted,
+		Clustered:       n.Clustered,
+		Models:          n.Models,
+		ModelsByEngine:  n.ModelsByEngine,
+		LoadedByEngine:  n.LoadedByEngine,
+		RoutingByEngine: n.RoutingByEngine,
 	}
 }
 

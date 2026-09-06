@@ -23,6 +23,7 @@ import (
 	"nvpair-shared/errors"
 	"nvpair-shared/nodeid"
 	"nvpair-shared/noderec"
+	"nvpair-shared/routing"
 	"nvpair-shared/schedulerwire"
 
 	"nvpair-ui-broker/relay"
@@ -112,6 +113,13 @@ type AvailableNode struct {
 	// consumer show which of a remote node's models are loaded. Omitted
 	// when no engine reports loaded state.
 	LoadedByEngine map[string][]string `json:"loadedByEngine,omitempty"`
+	// RoutingByEngine carries per-engine, capability-aware routing metadata (api
+	// family, model aliases/capabilities, context window, priority, capacity,
+	// timeouts, lifecycle mode, enabled/draining), keyed by engine-manager engine
+	// name, enriched from the peer's /v1/models routingByEngine field. It is
+	// credential-free — backend authentication is node-local and never leaves the
+	// owning node. Omitted when a node advertises no routing metadata.
+	RoutingByEngine map[string]routing.EngineRouting `json:"routingByEngine,omitempty"`
 }
 
 // GetNodesResult is the response to "discovery:get-nodes". Wrapped in an

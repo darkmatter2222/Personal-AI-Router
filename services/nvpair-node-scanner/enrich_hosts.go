@@ -8,14 +8,18 @@ import (
 	"sync"
 
 	"nvpair-shared/noderec"
+	"nvpair-shared/routing"
 )
 
-// modelInventory is the three-part answer a node's engine manager gives, carried
-// as one value so the concurrent ask can return it.
+// modelInventory is the answer a node's engine manager gives, carried as one
+// value so the concurrent ask can return it: the flat model union, the
+// per-engine attribution, the per-engine loaded set, and the per-engine
+// declarative routing metadata.
 type modelInventory struct {
-	models         []string
-	byEngine       map[string][]string
-	loadedByEngine map[string][]string
+	models          []string
+	byEngine        map[string][]string
+	loadedByEngine  map[string][]string
+	routingByEngine map[string]routing.EngineRouting
 }
 
 // hostKey identifies one node's endpoint for one service. Node-info and the engine

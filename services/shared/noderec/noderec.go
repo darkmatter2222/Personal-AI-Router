@@ -33,6 +33,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"nvpair-shared/routing"
 )
 
 const (
@@ -514,7 +516,18 @@ type DirectoryNode struct {
 	// empty list means "running, nothing loaded"; a missing key means the peer
 	// didn't report loaded state for it. Omitted when the peer reports none.
 	LoadedByEngine map[string][]string `json:"loadedByEngine,omitempty"`
-	LastSeen       int64               `json:"lastSeen"` // Unix seconds
+	// RoutingByEngine carries per-engine, capability-aware routing metadata,
+	// keyed by the same arbitrary engine-manager engine name as ModelsByEngine.
+	// It is the credential-free declarative contract (capabilities, context,
+	// model aliases, priority, capacity, timeouts, api family, lifecycle,
+	// enabled/draining state) an operator declared in the engine manifest,
+	// enriched from engine-manager's em /v1/models routingByEngine field. It is
+	// additive and opt-in: a peer that advertises no routing metadata omits it
+	// entirely and keeps PAIR's existing (legacy) routing behaviour. It never
+	// contains secrets — backend credentials are node-local and are deliberately
+	// absent from routing.EngineRouting.
+	RoutingByEngine map[string]routing.EngineRouting `json:"routingByEngine,omitempty"`
+	LastSeen        int64                            `json:"lastSeen"` // Unix seconds
 }
 
 // Clustered reports whether the node advertises a cluster identity.
@@ -575,6 +588,18 @@ func (n DirectoryNode) EngineModels(engine string) []string {
 		return n.ModelsByEngine[engine]
 	}
 	return n.Models
+}
+
+// EngineRouting returns the declared routing metadata for one engine on this
+// node and whether the node advertised any. A node with no routing metadata (a
+// legacy/built-in peer) returns ok=false, which callers read as "use the
+// existing model-inventory routing" rather than "route nowhere".
+func (n DirectoryNode) EngineRouting(engine string) (routing.EngineRouting, bool) {
+	if n.RoutingByEngine == nil {
+		return routing.EngineRouting{}, false
+	}
+	r, ok := n.RoutingByEngine[engine]
+	return r, ok
 }
 
 // SubscribeParams filters a subscription to nodes advertising any of the listed
