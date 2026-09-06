@@ -20,8 +20,12 @@ type Requirements struct {
 	// family gate.
 	APIFamily APIFamily
 	// HasImages is true when any message/content carries an image in any of the
-	// supported forms.
+	// supported forms. It is the boolean view of ImageCount (ImageCount > 0).
 	HasImages bool
+	// ImageCount is the number of image parts detected across all supported forms
+	// (content-block images, per-message Ollama images, and top-level Ollama
+	// images). It drives a conservative per-image context reserve.
+	ImageCount int
 	// RequiresTools is true when the request declares one or more tools
 	// (or legacy functions).
 	RequiresTools bool
@@ -57,17 +61,68 @@ const (
 	// perMessageOverhead accounts for chat framing tokens (role markers,
 	// separators) added per message by chat templates.
 	perMessageOverhead = 4
+
+	// DefaultOutputReserveTokens is the conservative output allowance used when a
+	// request does not specify a maximum output length. Treating unspecified
+	// output as zero under-reserves context (a request whose input nearly fills a
+	// window would be judged to fit when the completion cannot), so a single
+	// central default is added instead. Tuned for safe routing, not billing.
+	DefaultOutputReserveTokens = 512
+	// DefaultImageTokenReservePerImage is a conservative per-image context
+	// allowance. Exact image-token cost is backend/model specific; this is a safe
+	// over-estimate so an image-heavy request is not routed to a too-small window.
+	DefaultImageTokenReservePerImage = 1024
+	// maxTokenEstimate caps every token estimate so a pathological request cannot
+	// overflow int arithmetic and wrap to a small or negative required context.
+	maxTokenEstimate = 1 << 30
 )
 
 // estimateTokensFromChars converts a character count to a conservative token
 // estimate, rounding up so a single character still counts as at least one
-// token.
+// token. It saturates at maxTokenEstimate so a pathologically large input cannot
+// overflow the multiplication.
 func estimateTokensFromChars(chars int) int {
 	if chars <= 0 {
 		return 0
 	}
-	// ceil(chars * num / den)
-	return (chars*tokensPerCharNum + tokensPerCharDen - 1) / tokensPerCharDen
+	if chars > maxTokenEstimate {
+		// tokens are always fewer than chars for this ratio, so capping the input
+		// first both prevents overflow and keeps the result within the cap.
+		chars = maxTokenEstimate
+	}
+	t := (chars*tokensPerCharNum + tokensPerCharDen - 1) / tokensPerCharDen
+	if t > maxTokenEstimate {
+		t = maxTokenEstimate
+	}
+	return t
+}
+
+// satAdd adds two non-negative token counts, saturating at maxTokenEstimate and
+// never returning negative.
+func satAdd(a, b int) int {
+	if a < 0 {
+		a = 0
+	}
+	if b < 0 {
+		b = 0
+	}
+	s := a + b
+	if s < a || s > maxTokenEstimate { // s < a detects wraparound
+		return maxTokenEstimate
+	}
+	return s
+}
+
+// satMul multiplies two non-negative token counts, saturating at
+// maxTokenEstimate.
+func satMul(a, b int) int {
+	if a <= 0 || b <= 0 {
+		return 0
+	}
+	if a > maxTokenEstimate/b {
+		return maxTokenEstimate
+	}
+	return a * b
 }
 
 // rawRequest is the permissive superset of the OpenAI and Ollama request shapes
@@ -124,19 +179,16 @@ func Classify(body []byte) Requirements {
 	req.Model = r.Model
 
 	inputChars := 0
+	imageCount := 0
 
 	// Chat messages.
 	for _, m := range r.Messages {
 		req.InputTokensEst += perMessageOverhead
 		inputChars += utf8.RuneCountInString(m.Role)
-		text, hasImg := decodeContent(m.Content)
+		text, imgs := decodeContent(m.Content)
 		inputChars += utf8.RuneCountInString(text)
-		if hasImg {
-			req.HasImages = true
-		}
-		if len(m.Images) > 0 {
-			req.HasImages = true
-		}
+		imageCount += imgs
+		imageCount += len(m.Images) // Ollama per-message base64 images
 		if len(m.ToolCalls) > 0 {
 			// Assistant tool-call history implies a tool-using conversation.
 			req.RequiresTools = true
@@ -149,9 +201,7 @@ func Classify(body []byte) Requirements {
 	inputChars += rawTextChars(r.Suffix)
 
 	// Top-level Ollama images.
-	if len(r.Images) > 0 {
-		req.HasImages = true
-	}
+	imageCount += len(r.Images)
 
 	// Tools / functions: both presence (gate) and size (context cost).
 	if len(r.Tools) > 0 || len(r.Functions) > 0 {
@@ -168,12 +218,28 @@ func Classify(body []byte) Requirements {
 		req.RequiresStream = true
 	}
 
-	req.InputTokensEst += estimateTokensFromChars(inputChars)
+	req.InputTokensEst = satAdd(req.InputTokensEst, estimateTokensFromChars(inputChars))
 	req.OutputTokensReq = resolveOutputTokens(r)
+	req.ImageCount = imageCount
+	req.HasImages = imageCount > 0
 	req.RequestedContext = resolveRequestedContext(r)
-	// The required window is the larger of the estimated conversation size and
-	// an explicitly requested context window: an endpoint must satisfy both.
-	req.RequiredContext = max(req.InputTokensEst+req.OutputTokensReq, req.RequestedContext)
+
+	// Conservative required-context estimate. Unspecified/unbounded output uses a
+	// default reserve rather than zero (never under-reserving), images add a
+	// per-image reserve, and the whole thing is the larger of the estimated
+	// conversation size and any explicitly requested window (num_ctx floor). All
+	// arithmetic saturates so a pathological request can never wrap to a small or
+	// negative value.
+	effectiveOutput := req.OutputTokensReq
+	if effectiveOutput <= 0 {
+		effectiveOutput = DefaultOutputReserveTokens
+	}
+	imageReserve := satMul(req.ImageCount, DefaultImageTokenReservePerImage)
+	conversation := satAdd(satAdd(req.InputTokensEst, effectiveOutput), imageReserve)
+	req.RequiredContext = conversation
+	if req.RequestedContext > req.RequiredContext {
+		req.RequiredContext = req.RequestedContext
+	}
 	return req
 }
 
@@ -181,7 +247,11 @@ func Classify(body []byte) Requirements {
 // (Ollama options.num_ctx). A non-positive value is treated as unspecified.
 func resolveRequestedContext(r rawRequest) int {
 	if r.Options != nil && r.Options.NumCtx != nil {
-		return clampNonNeg(*r.Options.NumCtx)
+		v := clampNonNeg(*r.Options.NumCtx)
+		if v > maxTokenEstimate {
+			v = maxTokenEstimate // saturate an absurd requested window
+		}
+		return v
 	}
 	return 0
 }
@@ -248,33 +318,33 @@ type contentBlock struct {
 	Source      json.RawMessage `json:"source"`
 }
 
-// decodeContent extracts the concatenated text and whether any image is present
+// decodeContent extracts the concatenated text and the number of image parts
 // from a message "content" field, which may be a plain string or an array of
-// structured blocks. It is total: any unexpected shape yields ("", false)
-// rather than an error or panic.
-func decodeContent(raw json.RawMessage) (text string, hasImage bool) {
+// structured blocks. It is total: any unexpected shape yields ("", 0) rather
+// than an error or panic.
+func decodeContent(raw json.RawMessage) (text string, images int) {
 	if len(raw) == 0 {
-		return "", false
+		return "", 0
 	}
 	// String content.
 	var s string
 	if json.Unmarshal(raw, &s) == nil {
-		return s, false
+		return s, 0
 	}
 	// Array of blocks.
 	var blocks []json.RawMessage
 	if json.Unmarshal(raw, &blocks) != nil {
-		return "", false
+		return "", 0
 	}
 	var b []byte
 	for _, blk := range blocks {
 		t, img := decodeBlock(blk)
 		b = append(b, t...)
 		if img {
-			hasImage = true
+			images++
 		}
 	}
-	return string(b), hasImage
+	return string(b), images
 }
 
 // decodeBlock returns a single content block's text and whether it is an image

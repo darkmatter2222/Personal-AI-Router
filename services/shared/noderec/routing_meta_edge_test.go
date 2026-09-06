@@ -5,6 +5,7 @@ package noderec
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"nvpair-shared/routing"
@@ -44,5 +45,36 @@ func TestDirectoryNode_MultipleEnginesRoutingIndependent(t *testing.T) {
 	// An engine not present returns the legacy "use existing routing" signal.
 	if _, ok := out.EngineRouting("engine-c"); ok {
 		t.Fatal("absent engine must return ok=false")
+	}
+}
+
+// TestDirectoryNode_RoutingByEngineNeverCarriesAuth: routing metadata on the
+// discovery wire structurally cannot carry a backend credential (routing.
+// EngineRouting has no auth field), so a peer never receives another node's
+// secret.
+func TestDirectoryNode_RoutingByEngineNeverCarriesAuth(t *testing.T) {
+	n := DirectoryNode{
+		HostUUID: "u",
+		Services: map[ServiceKey]ServiceStatus{},
+		RoutingByEngine: map[string]routing.EngineRouting{
+			"custom-runtime": {
+				APIFamily: routing.APIFamilyOpenAI,
+				Priority:  prio(10),
+				Models: []routing.ModelRouting{{
+					Physical: "actual-upstream-model", Aliases: []string{"local-coding"},
+					Capabilities: routing.Capabilities{Text: true},
+				}},
+			},
+		},
+	}
+	b, err := json.Marshal(n)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	js := strings.ToLower(string(b))
+	for _, bad := range []string{"authorization", "bearer", "secret", "valueenv", "credential"} {
+		if strings.Contains(js, bad) {
+			t.Fatalf("discovery routing metadata leaked %q: %s", bad, string(b))
+		}
 	}
 }

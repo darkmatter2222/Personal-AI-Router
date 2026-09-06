@@ -28,22 +28,55 @@ func (e EngineRouting) Validate() error {
 		e.Timeouts.FirstByteMS < 0 || e.Timeouts.ActionMS < 0 {
 		return fmt.Errorf("routing: negative timeout")
 	}
-	seen := make(map[string]struct{}, len(e.Models))
+	// Priority (a *int) may be any value including negative: lower is preferred,
+	// so a negative priority is simply the most-preferred and is intentionally
+	// allowed. Capacity 0 = unbounded; a negative capacity was rejected above.
+	if e.Health.Path != "" && !validHealthPath(e.Health.Path) {
+		return fmt.Errorf("routing: invalid health path %q (must start with '/' and contain no control characters)", e.Health.Path)
+	}
+	// Physical names and aliases share ONE namespace within an endpoint: a
+	// requested name must resolve to exactly one model. Any duplication — a
+	// repeated physical name, a repeated alias (within or across models), or an
+	// alias that collides with any physical name — is ambiguous (manifest-order
+	// dependent) and is rejected. Across DIFFERENT endpoints the same alias
+	// mapping to different physical models remains valid; that is the whole
+	// heterogeneous abstraction and is out of scope for one EngineRouting.
+	seen := make(map[string]struct{})
+	claim := func(name, kind string, mi int) error {
+		if !validModelName(name) {
+			return fmt.Errorf("routing: model[%d] invalid %s name %q", mi, kind, name)
+		}
+		if _, dup := seen[name]; dup {
+			return fmt.Errorf("routing: model[%d] name %q is ambiguous (physical/alias namespace must be unique within an endpoint)", mi, name)
+		}
+		seen[name] = struct{}{}
+		return nil
+	}
 	for i, m := range e.Models {
-		if !validModelName(m.Physical) {
-			return fmt.Errorf("routing: model[%d] invalid physical name %q", i, m.Physical)
+		if err := claim(m.Physical, "physical", i); err != nil {
+			return err
 		}
-		if _, dup := seen[m.Physical]; dup {
-			return fmt.Errorf("routing: model[%d] duplicate physical name %q", i, m.Physical)
-		}
-		seen[m.Physical] = struct{}{}
-		for j, a := range m.Aliases {
-			if !validModelName(a) {
-				return fmt.Errorf("routing: model[%d] alias[%d] invalid name %q", i, j, a)
+		for _, a := range m.Aliases {
+			if err := claim(a, "alias", i); err != nil {
+				return err
 			}
 		}
 	}
 	return nil
+}
+
+// validHealthPath reports whether s is a usable health-probe path: it must begin
+// with '/' and contain no control characters.
+func validHealthPath(s string) bool {
+	if s == "" || s[0] != '/' {
+		return false
+	}
+	for _, r := range s {
+		if r < 0x20 || r == 0x7F {
+			return false
+		}
+	}
+	return true
 }
 
 // validModelName reports whether s is a usable model name: non-empty, not

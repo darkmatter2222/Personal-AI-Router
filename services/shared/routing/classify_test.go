@@ -99,8 +99,8 @@ func TestClassify_ModelAndFlags(t *testing.T) {
 			if (req.InputTokensEst > 0) != c.wantInputGT0 {
 				t.Errorf("InputTokensEst = %d, want >0 == %v", req.InputTokensEst, c.wantInputGT0)
 			}
-			if req.RequiredContext != req.InputTokensEst+req.OutputTokensReq {
-				t.Errorf("RequiredContext = %d, want input(%d)+output(%d)", req.RequiredContext, req.InputTokensEst, req.OutputTokensReq)
+			if req.RequiredContext < req.InputTokensEst+req.OutputTokensReq {
+				t.Errorf("RequiredContext = %d, want >= input(%d)+output(%d)", req.RequiredContext, req.InputTokensEst, req.OutputTokensReq)
 			}
 		})
 	}
@@ -137,19 +137,24 @@ func TestClassify_ContextGrowsWithTools(t *testing.T) {
 
 func TestDecodeContentHelpers(t *testing.T) {
 	// decodeContent: string form.
-	txt, img := decodeContent(json.RawMessage(`"plain string"`))
-	if txt != "plain string" || img {
-		t.Fatalf("string content = (%q,%v)", txt, img)
+	txt, imgs := decodeContent(json.RawMessage(`"plain string"`))
+	if txt != "plain string" || imgs != 0 {
+		t.Fatalf("string content = (%q,%d)", txt, imgs)
 	}
-	// decodeContent: block array with text + image.
-	txt, img = decodeContent(json.RawMessage(`[{"type":"text","text":"a"},{"type":"text","text":"b"},{"type":"image_url","image_url":{"url":"x"}}]`))
-	if txt != "ab" || !img {
-		t.Fatalf("blocks = (%q,%v), want (ab,true)", txt, img)
+	// decodeContent: block array with text + one image.
+	txt, imgs = decodeContent(json.RawMessage(`[{"type":"text","text":"a"},{"type":"text","text":"b"},{"type":"image_url","image_url":{"url":"x"}}]`))
+	if txt != "ab" || imgs != 1 {
+		t.Fatalf("blocks = (%q,%d), want (ab,1)", txt, imgs)
+	}
+	// decodeContent: two images.
+	_, imgs = decodeContent(json.RawMessage(`[{"type":"image_url","image_url":{"url":"a"}},{"type":"image_url","image_url":{"url":"b"}}]`))
+	if imgs != 2 {
+		t.Fatalf("two-image blocks = %d, want 2", imgs)
 	}
 	// decodeContent: malformed -> empty, no panic.
-	txt, img = decodeContent(json.RawMessage(`{bad`))
-	if txt != "" || img {
-		t.Fatalf("malformed content = (%q,%v)", txt, img)
+	txt, imgs = decodeContent(json.RawMessage(`{bad`))
+	if txt != "" || imgs != 0 {
+		t.Fatalf("malformed content = (%q,%d)", txt, imgs)
 	}
 	// decodeBlock: bare string element.
 	txt, isImg := decodeBlock(json.RawMessage(`"bare"`))

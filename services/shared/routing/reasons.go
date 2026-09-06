@@ -47,6 +47,28 @@ const (
 	// ReasonAuthUnavailable: the endpoint requires local credentials that could
 	// not be resolved on the owning node.
 	ReasonAuthUnavailable Reason = "AUTH_UNAVAILABLE"
+
+	// Execution-time reasons produced by the forwarder. They are deliberately
+	// more precise than a single "unhealthy" bucket so a routing trace can tell,
+	// for a heterogeneous fleet, a cold-model first-byte timeout apart from an
+	// unreachable node.
+
+	// ReasonTargetUnavailable: no backend target could be resolved for the
+	// endpoint on this node (missing/removed local backend mapping).
+	ReasonTargetUnavailable Reason = "TARGET_UNAVAILABLE"
+	// ReasonConnectFailed: the transport failed before any response status line
+	// (dial/TLS/connection error).
+	ReasonConnectFailed Reason = "UPSTREAM_CONNECT_FAILED"
+	// ReasonHeaderTimeout: the response status+headers did not arrive within the
+	// endpoint's response-header timeout.
+	ReasonHeaderTimeout Reason = "UPSTREAM_HEADER_TIMEOUT"
+	// ReasonFirstByteTimeout: headers arrived but the first output byte did not,
+	// within the endpoint's first-byte timeout (a cold model / stalled generation).
+	ReasonFirstByteTimeout Reason = "UPSTREAM_FIRST_BYTE_TIMEOUT"
+	// ReasonUpstream5xx: the upstream returned a retryable server error status.
+	ReasonUpstream5xx Reason = "UPSTREAM_5XX"
+	// ReasonClientCancelled: the client's context was cancelled before commit.
+	ReasonClientCancelled Reason = "CLIENT_CANCELLED"
 )
 
 // String returns the reason code as a string.

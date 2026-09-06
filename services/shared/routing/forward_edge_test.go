@@ -80,7 +80,7 @@ func TestForward_RewriteDisabledLeavesBody(t *testing.T) {
 }
 
 // TestForward_HeaderTimeoutAllCandidates: when every candidate times out waiting
-// for headers, no response is committed from upstream, a local 503 is written,
+// for headers, no response is committed from upstream, a local 504 is written,
 // and every reservation is released.
 func TestForward_HeaderTimeoutAllCandidates(t *testing.T) {
 	ps := NewPools()
@@ -97,8 +97,8 @@ func TestForward_HeaderTimeoutAllCandidates(t *testing.T) {
 	if res.ServedEndpoint != "" {
 		t.Fatalf("no upstream should have served, got %q", res.ServedEndpoint)
 	}
-	if rec.Code != http.StatusServiceUnavailable {
-		t.Fatalf("all-timeout should yield local 503, got %d", rec.Code)
+	if rec.Code != http.StatusGatewayTimeout {
+		t.Fatalf("all-header-timeout should yield local 504, got %d", rec.Code)
 	}
 	if u, _ := ps.Used("A"); u != 0 {
 		t.Fatal("A capacity leaked")
