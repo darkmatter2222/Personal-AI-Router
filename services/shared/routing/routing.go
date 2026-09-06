@@ -1,170 +1,71 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// Package routing is the control-plane routing core shared by the two
-// inference proxies. It classifies an incoming request, applies capability
-// eligibility gates BEFORE scheduling, then selects deterministically by
-// declared priority and reserves static capacity. It operates on in-memory
-// state only: no synchronous health probe, GPU query, or model discovery on
-// the inference hot path (control plane vs data plane).
+// Package routing is the control-plane routing core shared by the inference
+// proxies. It is the pure DECISION layer of the inference pipeline:
+//
+//	CLASSIFY -> DECIDE -> RESERVE -> FORWARD
+//
+// Classify derives routing requirements from a raw request body. Decide
+// (Select) applies capability and lifecycle eligibility gates BEFORE any
+// priority or load scheduling, then selects deterministically by the routing
+// strategy. The pools provide atomic admission reservations. The proxy owns
+// the FORWARD phase and releases the reservation on every terminal path.
+//
+// It operates on in-memory state only: no synchronous health probe, GPU
+// query, or model discovery on the inference hot path (control plane vs data
+// plane).
 package routing
 
 import (
-	"encoding/json"
-	"math"
 	"sort"
 	"sync"
+
+	"nvpair-shared/noderec"
 )
 
 // Rejection reasons are stable, explainable diagnostic codes. A routing
 // decision can answer "why was this backend rejected?" without exposing
 // request content.
 const (
+	ReasonTextRequired      = "TEXT_REQUIRED"
 	ReasonVisionRequired    = "VISION_REQUIRED"
 	ReasonToolsRequired     = "TOOLS_REQUIRED"
 	ReasonStreamingRequired = "STREAMING_REQUIRED"
 	ReasonContextTooSmall   = "CONTEXT_TOO_SMALL"
 	ReasonModelNotAvailable = "MODEL_NOT_AVAILABLE"
+	ReasonAPIFamily         = "API_FAMILY_INCOMPATIBLE"
 	ReasonEndpointUnhealthy = "ENDPOINT_UNHEALTHY"
 	ReasonEndpointDisabled  = "ENDPOINT_DISABLED"
 	ReasonEndpointDraining  = "ENDPOINT_DRAINING"
 	ReasonCapacityFull      = "CAPACITY_FULL"
+	// ReasonNotSelected marks an eligible candidate that lost the selection
+	// to a higher-priority eligible candidate (deterministic spillover).
+	ReasonNotSelected = "NOT_SELECTED"
 )
 
 // Selected marks a candidate that won selection.
 const Selected = "selected"
 
-// Req is a classified request: enough of an OpenAI/Ollama body to establish
-// eligibility. It never carries prompt or response content, only derived
-// flags and token budgets.
-type Req struct {
-	Model             string
-	HasImages         bool
-	RequiresTools     bool
-	RequiresStreaming bool
-	InputTokens       int
-	MaxOutput         int
-	RequiredContext   int
-}
+// Routing strategies. A request's candidate set is ordered by exactly ONE
+// strategy, so two policies never run sequentially and reorder each other:
+//
+//   - StrategyDefault preserves PAIR's existing behavior: the legacy dynamic
+//     scheduler (least-loaded ordering, reserveCandidate) owns the order, and
+//     capability eligibility still runs first.
+//   - StrategyDeterministic ranks purely by declared priority (lower =
+//     preferred, ID tie-break) and bypasses the dynamic scheduler: the
+//     selected candidate is tried first and the dynamic scheduler must not
+//     re-order the list behind it.
+const (
+	StrategyDefault       = "scheduler"
+	StrategyDeterministic = "deterministic"
+)
 
-// probe is the minimal decode target. It reads just the fields needed for
-// classification without a full model-specific parse.
-type probe struct {
-	Model    string `json:"model"`
-	Stream    bool   `json:"stream"`
-	MaxTokens  int    `json:"max_tokens"`
-	MaxOutput int    `json:"max_completion_tokens"`
-	Tools     any    `json:"tools"`
-	Prompt    string `json:"prompt"`
-	Options   *struct {
-		NumPredict int `json:"num_predict"`
-	} `json:"options"`
-	Messages []struct {
-		Content any `json:"content"`
-	} `json:"messages"`
-}
-
-// Classify derives request requirements from a raw request body. It parses
-// just enough JSON to detect images, tools, streaming, and a conservative
-// context budget — no tokenizer. The input-token estimate is chars/4.
-func Classify(body []byte) Req {
-	var p probe
-	if len(body) > 0 {
-		_ = json.Unmarshal(body, &p)
-	}
-
-	req := Req{
-		Model:             p.Model,
-		RequiresStreaming: p.Stream,
-	}
-
-	// Max output: prefer an explicit max_completion_tokens (OpenAI), then
-	// max_tokens (OpenAI), then Ollama options.num_predict.
-	if p.MaxOutput > 0 {
-		req.MaxOutput = p.MaxOutput
-	} else if p.MaxTokens > 0 {
-		req.MaxOutput = p.MaxTokens
-	} else if p.Options != nil && p.Options.NumPredict > 0 {
-		req.MaxOutput = p.Options.NumPredict
-	}
-
-	// Tools present (non-empty array) means the request requires tool calling.
-	if p.Tools != nil {
-		if arr, ok := p.Tools.([]any); ok && len(arr) > 0 {
-			req.RequiresTools = true
-		}
-	}
-
-	// Images: scan message content for image blocks / image_url entries.
-	req.HasImages = detectImage(p.Messages)
-
-	// Conservative input token estimate from prompt length (chars/4).
-	prompt := p.Prompt
-	for _, m := range p.Messages {
-		prompt += stringContent(m.Content)
-	}
-	req.InputTokens = len(prompt) / 4
-
-	// Required context = input + requested output + a safety reserve. The
-	// reserve is the larger of a fixed floor and a small percent of the
-	// prompt, so a request is not routed to an endpoint whose max context
-	// cannot fit it.
-	reserve := 4096
-	if pct := int(math.Round(float64(len(prompt)) * 0.05)); pct > reserve {
-		reserve = pct
-	}
-	req.RequiredContext = req.InputTokens + req.MaxOutput + reserve
-	return req
-}
-
-// stringContent flattens a message content (string or block array) into a
-// string length source for the token estimate.
-func stringContent(c any) string {
-	switch v := c.(type) {
-	case string:
-		return v
-	case []any:
-		for _, part := range v {
-			if m, ok := part.(map[string]any); ok {
-				if s, ok := m["text"]; ok {
-					if str, ok := s.(string); ok {
-						v = append(v, str)
-					}
-				}
-			}
-		}
-		return ""
-	default:
-		return ""
-	}
-}
-
-// detectImage reports whether any message content carries an image (OpenAI
-// content-array image blocks, or an image_url entry).
-func detectImage(msgs []struct {
-	Content any `json:"content"`
-}) bool {
-	for _, m := range msgs {
-		switch c := m.Content.(type) {
-		case string:
-			// plain text content; no image.
-		case []any:
-			for _, part := range c {
-				pm, ok := part.(map[string]any)
-				if !ok {
-					continue
-				}
-				typ, _ := pm["type"].(string)
-				if typ == "image" || typ == "image_url" || typ == "image_base64" || typ == "input_image" {
-					return true
-				}
-				if _, has := pm["image_url"]; has {
-					return true
-				}
-			}
-		}
-	}
-	return false
+// ValidStrategy reports whether s is a known routing strategy; an unknown or
+// empty value falls back to StrategyDefault.
+func ValidStrategy(s string) bool {
+	return s == StrategyDefault || s == StrategyDeterministic
 }
 
 // EndpointCaps is the capability + envelope snapshot of one endpoint/engine
@@ -175,7 +76,11 @@ type EndpointCaps struct {
 	Vision    *bool
 	Tools     *bool
 	Streaming *bool
-	Reasoning *bool
+	// Reasoning is metadata-only at the selection layer: it is carried and
+	// advertised so a future request type can gate on it, but Select does not
+	// reject on it today (no request form reliably declares a reasoning
+	// requirement). It must not be presented as an enforced gate.
+	Reasoning  *bool
 	MaxContext int
 }
 
@@ -183,10 +88,13 @@ type EndpointCaps struct {
 // A nil flag is treated as false (unsupported).
 func boolOn(v *bool) bool { return v != nil && *v }
 
-// CheckCaps returns the first failing capability gate (a reason code) or ""
+// Check returns the first failing capability gate (a reason code) or ""
 // when the endpoint can satisfy the request. Capability eligibility is
 // checked BEFORE any priority/load scheduling.
 func (c EndpointCaps) Check(req Req) string {
+	if req.Text && !boolOn(c.Text) {
+		return ReasonTextRequired
+	}
 	if req.HasImages && !boolOn(c.Vision) {
 		return ReasonVisionRequired
 	}
@@ -212,8 +120,12 @@ type Pool struct {
 }
 
 // NewPool creates a pool admitting at most capacity concurrent requests.
-// A capacity <= 0 means unbounded (no admission limit).
+// A capacity <= 0 means unbounded (no admission limit): this is the legacy
+// default for endpoints that declare no static capacity.
 func NewPool(capacity int) *Pool {
+	if capacity < 0 {
+		capacity = 0
+	}
 	return &Pool{cap: capacity}
 }
 
@@ -228,7 +140,8 @@ func (p *Pool) Reserve() bool {
 	return true
 }
 
-// Release frees a slot (no-op if already zero).
+// Release frees a slot. Releasing at zero is a no-op, so a double-release
+// cannot drive the counter negative.
 func (p *Pool) Release() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -244,31 +157,155 @@ func (p *Pool) Active() int {
 	return p.active
 }
 
+// Capacity returns the pool's current admission limit (0 = unbounded).
+func (p *Pool) Capacity() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.cap
+}
+
+// Resize atomically changes the pool's admission limit so a runtime
+// reconfiguration (e.g. static_capacity 1 -> 4 or 4 -> 1) takes effect
+// without a process restart. Existing reservations are preserved: when
+// shrinking below the current active count, new reservations are blocked
+// until the active count falls back to or below the new limit — in-flight
+// requests keep their slots, and a burst cannot oversubscribe the endpoint.
+func (p *Pool) Resize(capacity int) {
+	if capacity < 0 {
+		capacity = 0
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.cap = capacity
+}
+
+// ServesModel reports whether an endpoint serves the requested model: the
+// requested name must match a physical model in served or a declared logical
+// alias. An empty model (the request names no model) is trivially served by
+// every endpoint.
+func ServesModel(served []string, aliases []string, model string) bool {
+	if model == "" {
+		return true
+	}
+	if containsString(served, model) {
+		return true
+	}
+	return containsString(aliases, model)
+}
+
+func containsString(list []string, want string) bool {
+	for _, v := range list {
+		if v == want {
+			return true
+		}
+	}
+	return false
+}
+
+// ModelRefs collects an endpoint's model declarations: the singular ModelRef
+// (fixed single-model engines) plus the Models list (multi-model engines such
+// as Ollama / LM Studio).
+func ModelRefs(r *noderec.EngineRouting) []noderec.EngineModelRef {
+	if r == nil {
+		return nil
+	}
+	var refs []noderec.EngineModelRef
+	if r.ModelRef != nil {
+		refs = append(refs, *r.ModelRef)
+	}
+	refs = append(refs, r.Models...)
+	return refs
+}
+
+// AliasesOf collects the logical model aliases an endpoint declares, across
+// the singular ModelRef and every Models entry.
+func AliasesOf(r *noderec.EngineRouting) []string {
+	refs := ModelRefs(r)
+	var out []string
+	for i := range refs {
+		out = append(out, refs[i].Aliases...)
+	}
+	return out
+}
+
+// EffectiveCaps returns the capability flags and context budget that apply to
+// the requested model: a per-model declaration overrides the endpoint
+// defaults; a model with no per-model declaration inherits them. The first
+// matching declaration wins (deterministic: refs are walked in ModelRef-first
+// order).
+func EffectiveCaps(endpoint EndpointCaps, refs []noderec.EngineModelRef, model string) EndpointCaps {
+	out := endpoint
+	if model == "" {
+		return out
+	}
+	for i := range refs {
+		if !ServesModel([]string{refs[i].PhysicalName}, refs[i].Aliases, model) {
+			continue
+		}
+		if caps := refs[i].Caps; caps != nil {
+			out.Text = caps.Text
+			out.Vision = caps.Vision
+			out.Tools = caps.Tools
+			out.Streaming = caps.Streaming
+			out.Reasoning = caps.Reasoning
+		}
+		if refs[i].ContextMaxTokens > 0 {
+			out.MaxContext = refs[i].ContextMaxTokens
+		}
+		break
+	}
+	return out
+}
+
 // Candidate is one routable endpoint with its eligibility inputs.
 type Candidate struct {
 	ID       string
-	Priority  int
-	Capacity   *Pool
-	Healthy    bool
-	Enabled    bool
-	Draining   bool
-	MaxContext int
+	Priority int
+	Capacity *Pool
+	Healthy  bool
+	Enabled  bool
+	Draining bool
+	// APIFamily is the endpoint's wire protocol family ("openai", "ollama").
+	// Empty means undeclared and always compatible: legacy endpoints and
+	// endpoints inside a single-family proxy declare no family because it is
+	// implied.
+	APIFamily string
+	// Strategy selects the ordering policy (StrategyDefault or
+	// StrategyDeterministic); empty defaults to StrategyDefault.
+	Strategy   string
 	Caps       EndpointCaps
+	MaxContext int
+	// Served is the physical model names this endpoint serves (the node's
+	// model inventory); Aliases are the endpoint's declared logical model
+	// aliases. Together they back the model-availability gate: a request
+	// naming a model the endpoint does not serve is rejected with
+	// MODEL_NOT_AVAILABLE instead of falling through to an ineligible
+	// backend.
+	Served  []string
+	Aliases []string
+	// Models carries the endpoint's per-model declarations. When the
+	// requested model matches a declaration, its capability flags and
+	// context budget override the endpoint defaults (see EffectiveCaps).
+	Models []noderec.EngineModelRef
 }
 
 // Outcome records the selection result: the chosen candidate and a per-
-// candidate explanation (reason code or "selected").
+// candidate explanation (a reason code, "selected", or "not_selected").
 type Outcome struct {
 	SelectedID string
 	Reasons    map[string]string
 }
 
-// Select filters candidates through eligibility (lifecycle + capability
-// gates) then, among the eligible set, picks deterministically by declared
-// priority (lower = preferred) and reserves its static capacity. Capacity
-// reservation happens only after eligibility, so an ineligible endpoint can
-// never win merely because it is idle. If the preferred eligible endpoint is
-// full, selection spills to the next eligible one.
+// Select is the pure decision function: given classified requirements and
+// endpoint snapshots, it returns the selected endpoint and an explainable
+// per-candidate account. Eligibility — lifecycle, model availability, API
+// family, capability and context gates — runs BEFORE priority scheduling,
+// and capacity reservation happens only after eligibility, so an ineligible
+// endpoint can never win merely because it is idle. The selected candidate's
+// pool is reserved atomically; when the preferred eligible endpoint is full,
+// selection spills to the next eligible one. When nothing is eligible the
+// result carries no SelectedID and the caller must treat that as an
+// authoritative rejection (no fallback to an unfiltered candidate list).
 func Select(cands []Candidate, req Req) Outcome {
 	out := Outcome{Reasons: map[string]string{}}
 	var eligible []Candidate
@@ -285,7 +322,22 @@ func Select(cands []Candidate, req Req) Outcome {
 			out.Reasons[c.ID] = ReasonEndpointDraining
 			continue
 		}
-		if reason := c.Caps.Check(req); reason != "" {
+		if req.Model != "" && !ServesModel(c.Served, c.Aliases, req.Model) {
+			out.Reasons[c.ID] = ReasonModelNotAvailable
+			continue
+		}
+		if !apiFamilyCompatible(c.APIFamily, req.APIFamily) {
+			out.Reasons[c.ID] = ReasonAPIFamily
+			continue
+		}
+		caps := EffectiveCaps(c.Caps, c.Models, req.Model)
+		// A per-model declaration may set context without setting caps (or
+		// vice versa): the endpoint default and the model override compose,
+		// with the model's declared budget winning when it declares one.
+		if caps.MaxContext == 0 && c.MaxContext > 0 {
+			caps.MaxContext = c.MaxContext
+		}
+		if reason := caps.Check(req); reason != "" {
 			out.Reasons[c.ID] = reason
 			continue
 		}
@@ -311,9 +363,20 @@ func Select(cands []Candidate, req Req) Outcome {
 		// Mark the remaining eligible-but-not-selected candidates so operators
 		// can see the full decision (priority spillover).
 		for _, rest := range eligible[i+1:] {
-			out.Reasons[rest.ID] = "not_selected"
+			out.Reasons[rest.ID] = ReasonNotSelected
 		}
 		break
 	}
 	return out
+}
+
+// apiFamilyCompatible reports whether a candidate's declared API family can
+// serve a request for the given family. Either side empty means "not
+// declared", which is compatible: inside a single-family proxy the family is
+// implied, and a legacy endpoint may declare none.
+func apiFamilyCompatible(candidate, requested string) bool {
+	if candidate == "" || requested == "" {
+		return true
+	}
+	return candidate == requested
 }

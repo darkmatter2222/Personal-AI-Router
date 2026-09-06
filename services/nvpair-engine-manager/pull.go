@@ -62,6 +62,9 @@ func (e *Executor) PullModelStream(ctx context.Context, engine, model string, pa
 	if err != nil {
 		return nil, err
 	}
+	if st.manifest.isExternal() {
+		return nil, fmt.Errorf("engine %q is externally managed: pull is not authorized by its lifecycle", engine)
+	}
 	act, ok := st.manifest.Actions[pullModelAction]
 	if !ok {
 		return nil, fmt.Errorf("engine %q has no action %q", engine, pullModelAction)

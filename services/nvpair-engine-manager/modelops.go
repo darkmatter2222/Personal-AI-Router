@@ -17,6 +17,13 @@ type modelActionRequest struct {
 
 // ModelLoad warms a model into engine memory using each engine's manifest action.
 func (e *Executor) ModelLoad(ctx context.Context, engine, model string) (json.RawMessage, error) {
+	st, err := e.state(engine)
+	if err != nil {
+		return nil, err
+	}
+	if st.manifest.isExternal() {
+		return nil, fmt.Errorf("engine %q is externally managed: model load is not authorized by its lifecycle", engine)
+	}
 	action, params, err := modelActionWire(engine, "load", model)
 	if err != nil {
 		return nil, err
@@ -26,6 +33,13 @@ func (e *Executor) ModelLoad(ctx context.Context, engine, model string) (json.Ra
 
 // ModelUnload frees a model from engine memory.
 func (e *Executor) ModelUnload(ctx context.Context, engine, model string) (json.RawMessage, error) {
+	st, err := e.state(engine)
+	if err != nil {
+		return nil, err
+	}
+	if st.manifest.isExternal() {
+		return nil, fmt.Errorf("engine %q is externally managed: model unload is not authorized by its lifecycle", engine)
+	}
 	action, params, err := modelActionWire(engine, "unload", model)
 	if err != nil {
 		return nil, err
@@ -35,6 +49,13 @@ func (e *Executor) ModelUnload(ctx context.Context, engine, model string) (json.
 
 // ModelDelete removes a downloaded model from disk when the manifest exposes it.
 func (e *Executor) ModelDelete(ctx context.Context, engine, model string) (json.RawMessage, error) {
+	st, err := e.state(engine)
+	if err != nil {
+		return nil, err
+	}
+	if st.manifest.isExternal() {
+		return nil, fmt.Errorf("engine %q is externally managed: model delete is not authorized by its lifecycle", engine)
+	}
 	action, params, err := modelActionWire(engine, "delete", model)
 	if err != nil {
 		return nil, err

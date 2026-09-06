@@ -215,6 +215,7 @@ func buildRouting(m *Manifest) *noderec.EngineRouting {
 		r.ContextMaxTokens = m.Context.MaxTokens
 	}
 	if m.Routing != nil {
+		r.Strategy = m.Routing.Strategy
 		r.Priority = m.Routing.Priority
 		r.StaticCapacity = m.Routing.StaticCapacity
 		r.Pool = m.Routing.Pool

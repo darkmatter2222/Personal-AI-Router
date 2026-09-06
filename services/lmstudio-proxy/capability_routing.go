@@ -35,6 +35,14 @@ func staticCapacity(r *noderec.EngineRouting) int {
 	return r.StaticCapacity
 }
 
+// timeoutSpec extracts the declared per-endpoint timeout spec, nil-safe.
+func timeoutSpec(r *noderec.EngineRouting) *noderec.EngineTimeouts {
+	if r == nil {
+		return nil
+	}
+	return r.Timeouts
+}
+
 // routeInference applies capability-aware deterministic selection to the
 // candidate list for an inference request. It classifies the request, gates
 // candidates by declared capabilities and context, selects the best eligible
@@ -48,37 +56,24 @@ func (p *Proxy) routeInference(candidates []candidate, body []byte) ([]candidate
 	ranked := make([]routing.Candidate, 0, len(candidates))
 	candByID := make(map[string]candidate, len(candidates))
 	for _, c := range candidates {
-		caps, _, priority := routing.RoutingToEndpoint(c.routing)
+		base := routing.RoutingToCandidate(c.routing, c.served)
 		st, known := p.endpointStateLocked(c.id)
 
 		// Merge the two lifecycle sources: the async-maintained health facet
 		// (endpointState) and the manifest-declared admission flags
 		// (EngineRouting.Enabled / .Draining). Absent routing metadata means
 		// the endpoint is fully admitted (enabled, not draining, healthy).
-		enabled := true
-		draining := false
-		healthy := true
 		if known {
-			healthy = st.Healthy
-			enabled = enabled && st.Enabled
-			draining = draining || st.Draining
-		}
-		if c.routing != nil {
-			enabled = enabled && c.routing.Enabled
-			draining = draining || c.routing.Draining
+			base.Healthy = st.Healthy
+			base.Enabled = base.Enabled && st.Enabled
+			base.Draining = base.Draining || st.Draining
+		} else {
+			base.Healthy = true
 		}
 
-		rc := routing.Candidate{
-			ID:         c.id,
-			Priority:   priority,
-			Capacity:   p.ensurePool(c.id, staticCapacity(c.routing)),
-			Healthy:    healthy,
-			Enabled:    enabled,
-			Draining:   draining,
-			MaxContext: caps.MaxContext,
-			Caps:       caps,
-		}
-		ranked = append(ranked, rc)
+		base.ID = c.id
+		base.Capacity = p.ensurePool(c.id, staticCapacity(c.routing))
+		ranked = append(ranked, base)
 		candByID[c.id] = c
 	}
 

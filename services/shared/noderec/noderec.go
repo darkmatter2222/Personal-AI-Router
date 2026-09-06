@@ -609,12 +609,25 @@ type EngineRouting struct {
 	// consumer knows the endpoint needs auth without the secret crossing
 	// the trust boundary.
 	AuthHeadersPresent bool `json:"auth_headers_present,omitempty"`
-	// Enabled is the operator admission switch for this endpoint. It defaults
-	// to true when omitted (a missing key means "enabled").
-	Enabled bool `json:"enabled"`
+	// Enabled is the operator admission switch for this endpoint. A nil (omitted)
+	// value defaults to enabled: the manifest/producer sets it explicitly true
+	// unless the operator disabled the endpoint.
+	Enabled *bool `json:"enabled,omitempty"`
 	// Draining marks an endpoint that should stop receiving NEW requests while
 	// in-flight ones finish. Omitted means false.
 	Draining bool `json:"draining,omitempty"`
+	// Strategy selects the ordering policy for this endpoint's inference
+	// traffic: "scheduler" (default) keeps the dynamic least-loaded ordering;
+	// "deterministic" ranks purely by declared priority. The two policies are
+	// mutually exclusive: a deterministic endpoint never gets re-ordered by the
+	// dynamic scheduler.
+	Strategy string `json:"strategy,omitempty"`
+	// Models is the per-model capability/context declaration for multi-model
+	// engines (Ollama, LM Studio). Each entry names a physical model, its
+	// logical aliases, and that model's capability flags and context budget, so
+	// one engine process can serve models with different capabilities without
+	// forcing every model behind the engine to inherit the engine-level defaults.
+	Models []EngineModelRef `json:"models,omitempty"`
 }
 
 // EngineCaps mirrors the manifest capability flags.
@@ -626,17 +639,27 @@ type EngineCaps struct {
 	Reasoning *bool `json:"reasoning,omitempty"`
 }
 
-// EngineModelRef is the physical model name plus logical aliases.
+// EngineModelRef is the physical model name, its logical aliases, and the
+// model-specific capability flags and context budget. Omitted flags mean
+// "not declared" (treated as unsupported for gating). The engine-level
+// Capabilities/ContextMaxTokens remain the endpoint defaults; a model entry
+// overrides them for that model.
 type EngineModelRef struct {
 	PhysicalName string   `json:"physical_name,omitempty"`
 	Aliases      []string `json:"aliases,omitempty"`
+	// Caps, when set, are this model's capability flags (e.g. a vision model
+	// inside a multi-model engine while the engine default has no vision).
+	Caps *EngineCaps `json:"caps,omitempty"`
+	// ContextMaxTokens, when set, overrides the endpoint's default context
+	// budget for this model.
+	ContextMaxTokens int `json:"context_max_tokens,omitempty"`
 }
 
 // EngineTimeouts are per-endpoint timeout characteristics in milliseconds.
 type EngineTimeouts struct {
-	ConnectMS      int `json:"connect_ms,omitempty"`
+	ConnectMS        int `json:"connect_ms,omitempty"`
 	ResponseHeaderMS int `json:"response_header_ms,omitempty"`
-	FirstByteMS    int `json:"first_byte_ms,omitempty"`
+	FirstByteMS      int `json:"first_byte_ms,omitempty"`
 }
 
 // SubscribeParams filters a subscription to nodes advertising any of the listed

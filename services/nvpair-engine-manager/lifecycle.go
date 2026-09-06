@@ -88,6 +88,9 @@ func (e *Executor) StartWith(ctx context.Context, engine string, opts startOpts)
 	if err != nil {
 		return err
 	}
+	if st.manifest.isExternal() {
+		return fmt.Errorf("engine %q is externally managed: start is not authorized by its lifecycle", engine)
+	}
 	st.opMu.Lock()
 	defer st.opMu.Unlock()
 	if err := e.doStart(ctx, st, engine, opts); err != nil {
@@ -355,6 +358,9 @@ func (e *Executor) Stop(engine string) error {
 	st, err := e.state(engine)
 	if err != nil {
 		return err
+	}
+	if st.manifest.isExternal() {
+		return fmt.Errorf("engine %q is externally managed: stop is not authorized by its lifecycle", engine)
 	}
 	st.opMu.Lock()
 	defer st.opMu.Unlock()
@@ -678,6 +684,9 @@ func (e *Executor) Restart(ctx context.Context, engine string) error {
 	st, err := e.state(engine)
 	if err != nil {
 		return err
+	}
+	if st.manifest.isExternal() {
+		return fmt.Errorf("engine %q is externally managed: restart is not authorized by its lifecycle", engine)
 	}
 	st.opMu.Lock()
 	defer st.opMu.Unlock()

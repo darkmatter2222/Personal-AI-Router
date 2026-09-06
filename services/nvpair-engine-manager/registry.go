@@ -121,11 +121,16 @@ type ManifestContext struct {
 
 // ManifestRouting declares operator routing policy for the engine.
 type ManifestRouting struct {
+	// Strategy selects the ordering policy: "scheduler" (default, PAIR's
+	// existing dynamic least-loaded ordering) or "deterministic" (rank purely
+	// by declared priority, bypassing the dynamic scheduler).
+	Strategy string `json:"strategy,omitempty"`
 	// Priority is the deterministic baseline preference; lower values are
-	// preferred. Used only when the routing strategy is deterministic.
+	// preferred. Used when the routing strategy is deterministic.
 	Priority int `json:"priority,omitempty"`
 	// StaticCapacity is the maximum number of concurrent admitted requests
 	// (operator admission policy, not the runtime's theoretical limit).
+	// 0 = legacy/unbounded.
 	StaticCapacity int `json:"static_capacity,omitempty"`
 	// Pool is an optional workload tag grouping compatible endpoints.
 	Pool string `json:"pool,omitempty"`
@@ -658,6 +663,11 @@ func (m *Manifest) Validate() error {
 		if m.Routing != nil {
 			if m.Routing.StaticCapacity < 0 {
 				return errors.New("routing.static_capacity must be >= 0")
+			}
+			switch m.Routing.Strategy {
+			case "", "scheduler", "deterministic":
+			default:
+				return fmt.Errorf("routing.strategy %q invalid (want \"scheduler\" or \"deterministic\")", m.Routing.Strategy)
 			}
 		}
 		if m.Timeouts != nil {

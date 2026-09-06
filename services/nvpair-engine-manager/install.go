@@ -26,6 +26,9 @@ func (e *Executor) Install(ctx context.Context, engine string) error {
 	if err != nil {
 		return err
 	}
+	if st.manifest.isExternal() {
+		return fmt.Errorf("engine %q is externally managed: install is not authorized by its lifecycle", engine)
+	}
 	st.opMu.Lock()
 	defer st.opMu.Unlock()
 	if ok, _ := e.Detect(engine); ok {
@@ -131,6 +134,9 @@ func (e *Executor) Uninstall(ctx context.Context, engine string) error {
 	st, err := e.state(engine)
 	if err != nil {
 		return err
+	}
+	if st.manifest.isExternal() {
+		return fmt.Errorf("engine %q is externally managed: uninstall is not authorized by its lifecycle", engine)
 	}
 	st.opMu.Lock()
 	defer st.opMu.Unlock()

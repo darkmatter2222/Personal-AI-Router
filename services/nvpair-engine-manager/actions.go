@@ -17,6 +17,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"nvpair-shared/routing"
 )
 
 // Action runs a manifest-declared action against the engine and, when the
@@ -125,6 +127,20 @@ func (e *Executor) dispatchAction(ctx context.Context, st *engineState, engine, 
 		req.Header.Set("Content-Type", "application/json")
 	}
 	req.Header.Set(engineIdentityProbeHeader, "1")
+	// Apply the manifest-declared local auth headers (e.g. Authorization) so
+	// a credential-requiring engine's control API can authenticate. Values are
+	// resolved locally (env-expanded) and never cross the trust boundary.
+	if st.manifest.HTTP != nil {
+		headers, err := routing.ResolveHeaders(st.manifest.HTTP.Headers)
+		if err != nil {
+			return nil, fmt.Errorf("action %q: %w", action, err)
+		}
+		for k, v := range headers {
+			if v != "" {
+				req.Header.Set(k, v)
+			}
+		}
+	}
 	client := e.client
 	if engine == "ollama" && action == "run_model" && e.ollamaLoadClient != nil {
 		client = e.ollamaLoadClient

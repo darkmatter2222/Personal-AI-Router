@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"strings"
 
 	"nvpair-shared/noderec"
 	"nvpair-shared/routing"
@@ -35,6 +36,46 @@ func staticCapacity(r *noderec.EngineRouting) int {
 	return r.StaticCapacity
 }
 
+// timeoutSpec extracts the declared per-endpoint timeout spec, nil-safe.
+func timeoutSpec(r *noderec.EngineRouting) *noderec.EngineTimeouts {
+	if r == nil {
+		return nil
+	}
+	return r.Timeouts
+}
+
+// expandModelKeys adds normalized model keys (ollamaModelKey) to the served
+// list so the routing layer's exact-match ServesModel can match both the raw
+// name ("llama") and its canonical form ("llama:latest"). This preserves the
+// legacy proxy's model-availability semantics without changing the shared
+// routing package's exact-match contract.
+func expandModelKeys(served []string) []string {
+	if len(served) == 0 {
+		return served
+	}
+	seen := make(map[string]bool, len(served))
+	out := make([]string, 0, len(served)*2)
+	for _, m := range served {
+		if !seen[m] {
+			seen[m] = true
+			out = append(out, m)
+		}
+		key := ollamaModelKey(m)
+		if key != m && !seen[key] {
+			seen[key] = true
+			out = append(out, key)
+		}
+		// Also add the bare name (strip :tag) so a request for "llama"
+		// matches a node that only advertises "llama:latest".
+		bare := strings.SplitN(key, ":", 2)
+		if len(bare) == 2 && bare[0] != "" && !seen[bare[0]] {
+			seen[bare[0]] = true
+			out = append(out, bare[0])
+		}
+	}
+	return out
+}
+
 // routeInference applies capability-aware deterministic selection to the
 // candidate list for an inference request. It classifies the request, gates
 // candidates by declared capabilities and context, selects the best eligible
@@ -48,37 +89,25 @@ func (p *Proxy) routeInference(candidates []candidate, body []byte) ([]candidate
 	ranked := make([]routing.Candidate, 0, len(candidates))
 	candByID := make(map[string]candidate, len(candidates))
 	for _, c := range candidates {
-		caps, _, priority := routing.RoutingToEndpoint(c.routing)
+		served := expandModelKeys(c.served)
+		base := routing.RoutingToCandidate(c.routing, served)
 		st, known := p.endpointStateLocked(c.id)
 
 		// Merge the two lifecycle sources: the async-maintained health facet
 		// (endpointState) and the manifest-declared admission flags
 		// (EngineRouting.Enabled / .Draining). Absent routing metadata means
 		// the endpoint is fully admitted (enabled, not draining, healthy).
-		enabled := true
-		draining := false
-		healthy := true
 		if known {
-			healthy = st.Healthy
-			enabled = enabled && st.Enabled
-			draining = draining || st.Draining
-		}
-		if c.routing != nil {
-			enabled = enabled && c.routing.Enabled
-			draining = draining || c.routing.Draining
+			base.Healthy = st.Healthy
+			base.Enabled = base.Enabled && st.Enabled
+			base.Draining = base.Draining || st.Draining
+		} else {
+			base.Healthy = true
 		}
 
-		rc := routing.Candidate{
-			ID:         c.id,
-			Priority:   priority,
-			Capacity:   p.ensurePool(c.id, staticCapacity(c.routing)),
-			Healthy:    healthy,
-			Enabled:    enabled,
-			Draining:   draining,
-			MaxContext: caps.MaxContext,
-			Caps:       caps,
-		}
-		ranked = append(ranked, rc)
+		base.ID = c.id
+		base.Capacity = p.ensurePool(c.id, staticCapacity(c.routing))
+		ranked = append(ranked, base)
 		candByID[c.id] = c
 	}
 

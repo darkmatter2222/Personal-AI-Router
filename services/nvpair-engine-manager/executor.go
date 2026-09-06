@@ -64,6 +64,14 @@ type engineState struct {
 	startCancel context.CancelFunc
 }
 
+// isExternal reports whether the engine's manifest declares an external
+// (adopt-only) lifecycle. An external engine is observed and routed to, but
+// PAIR must not install, start, stop, restart, uninstall, pull, load, or
+// unload its process unless a specific capability authorizes the operation.
+func (m *Manifest) isExternal() bool {
+	return m.Lifecycle != nil && m.Lifecycle.Mode == "external"
+}
+
 // Executor owns engine lifecycle for every engine known on this host.
 // Methods are synchronous and safe for concurrent use; the JSON-RPC
 // layer runs the long ones (install, start) in goroutines so the read

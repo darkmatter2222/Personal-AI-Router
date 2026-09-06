@@ -34,36 +34,36 @@ func mockCaps(vision, tools, streaming, reasoning bool) *noderec.EngineCaps {
 func mockTopology() map[string]*noderec.EngineRouting {
 	return map[string]*noderec.EngineRouting{
 		"mock-a": {
-			APIFamily:      "openai",
-			Priority:       10,
-			StaticCapacity: 2,
-			Capabilities:   mockCaps(false, true, true, false),
+			APIFamily:        "openai",
+			Priority:         10,
+			StaticCapacity:   2,
+			Capabilities:     mockCaps(false, true, true, false),
 			ContextMaxTokens: 262144,
 		},
 		"mock-b": {
-			APIFamily:      "openai",
-			Priority:       20,
-			StaticCapacity: 1,
-			Capabilities:   mockCaps(false, true, true, false),
+			APIFamily:        "openai",
+			Priority:         20,
+			StaticCapacity:   1,
+			Capabilities:     mockCaps(false, true, true, false),
 			ContextMaxTokens: 262144,
 		},
 		"mock-c": {
-			APIFamily:      "openai",
-			Priority:       30,
-			StaticCapacity: 3,
-			Capabilities:   mockCaps(true, false, true, false),
+			APIFamily:        "openai",
+			Priority:         30,
+			StaticCapacity:   3,
+			Capabilities:     mockCaps(true, false, true, false),
 			ContextMaxTokens: 262144,
-			Timeouts:     &noderec.EngineTimeouts{FirstByteMS: 8000},
+			Timeouts:         &noderec.EngineTimeouts{FirstByteMS: 8000},
 		},
 		"mock-d": {
-			APIFamily:        "vllm",
+			APIFamily:          "vllm",
 			AuthHeadersPresent: true,
 		},
 		"mock-e": {
-			APIFamily:      "openai",
-			Priority:       5,
-			StaticCapacity: 10,
-			Capabilities:   mockCaps(false, false, true, false),
+			APIFamily:        "openai",
+			Priority:         5,
+			StaticCapacity:   10,
+			Capabilities:     mockCaps(false, false, true, false),
 			ContextMaxTokens: 65536,
 			ModelRef: &noderec.EngineModelRef{
 				PhysicalName: "local-coding-7b",
@@ -74,7 +74,7 @@ func mockTopology() map[string]*noderec.EngineRouting {
 }
 
 // mockCandidates maps the mock topology (or a subset by ID) onto the router's
-// endpoint snapshots via RoutingToEndpoint, wiring static-capacity pools and
+// endpoint snapshots via routingToCandidate, wiring static-capacity pools and
 // declared priorities. This is exactly what the proxies' routeInference does
 // with discovered nodes' RoutingByEngine metadata.
 func mockCandidates(t *testing.T, topology map[string]*noderec.EngineRouting, ids []string) []Candidate {
@@ -82,20 +82,13 @@ func mockCandidates(t *testing.T, topology map[string]*noderec.EngineRouting, id
 	out := make([]Candidate, 0, len(ids))
 	for _, id := range ids {
 		r := topology[id]
-		caps, pool, priority := RoutingToEndpoint(r)
+		c := RoutingToCandidate(r, nil)
+		c.ID = id
+		c.Healthy = true
 		// Simulated endpoints are admitted (enabled) by default; only an
 		// explicitly disabled mock (the lifecycle-gating case) sets Enabled=false
 		// on the Candidate after this helper returns.
-		out = append(out, Candidate{
-			ID:         id,
-			Priority:   priority,
-			Capacity:   pool,
-			Healthy:    true,
-			Enabled:    true,
-			Draining:   r.Draining,
-			MaxContext: caps.MaxContext,
-			Caps:       caps,
-		})
+		out = append(out, c)
 	}
 	return out
 }
@@ -110,9 +103,9 @@ func TestHeterogeneousRoutingAcceptance(t *testing.T) {
 	all := []string{"mock-a", "mock-b", "mock-c", "mock-e", "mock-d"}
 
 	cases := []struct {
-		name       string
-		req        Req
-		ids        []string
+		name        string
+		req         Req
+		ids         []string
 		wantSelect  string
 		wantReasons map[string]string
 	}{
@@ -251,17 +244,10 @@ func stableCandidates(ids []string) []Candidate {
 	topo := mockTopology()
 	cands := make([]Candidate, 0, len(ids))
 	for _, id := range ids {
-		r := topo[id]
-		caps, pool, priority := RoutingToEndpoint(r)
-		cands = append(cands, Candidate{
-			ID:         id,
-			Priority:   priority,
-			Capacity:   pool,
-			Healthy:    true,
-			Enabled:    true,
-			MaxContext: caps.MaxContext,
-			Caps:       caps,
-		})
+		c := RoutingToCandidate(topo[id], nil)
+		c.ID = id
+		c.Healthy = true
+		cands = append(cands, c)
 	}
 	return cands
 }
@@ -402,9 +388,10 @@ func TestHeterogeneousMultiNodeCluster(t *testing.T) {
 
 	cands := make([]Candidate, 0, 3)
 	for _, id := range []string{"node-a", "node-b", "node-c"} {
-		caps, pool, priority := RoutingToEndpoint(nodes[id])
-		cands = append(cands, Candidate{ID: id, Priority: priority, Capacity: pool,
-			Healthy: true, Enabled: true, MaxContext: caps.MaxContext, Caps: caps})
+		c := RoutingToCandidate(nodes[id], nil)
+		c.ID = id
+		c.Healthy = true
+		cands = append(cands, c)
 	}
 
 	// Normal coding request: deterministic preference routes to the lowest

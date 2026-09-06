@@ -887,6 +887,8 @@ type candidate struct {
 	// this proxy fronts (capabilities, aliases, capacity, priority, timeouts,
 	// auth presence). Nil when the node declared none.
 	routing *noderec.EngineRouting
+	// served is the node's model inventory for the engine this proxy fronts.
+	served []string
 }
 
 // routingForNode returns the node's routing metadata for the engine this proxy
@@ -1201,6 +1203,31 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		var out routing.Outcome
 		candidates, out, capPool = p.routeInference(candidates, bodyBytes)
 		reservedNodeID = out.SelectedID
+		// Capability rejection is authoritative (§32): when the selector found
+		// no eligible endpoint, the original candidate list is preserved (for
+		// failover diagnostics), but the request must NOT be forwarded to an
+		// endpoint that cannot satisfy it. Return a local no-eligible response.
+		if out.SelectedID == "" && len(candidates) > 0 {
+			reason := "no eligible endpoint"
+			if len(out.Reasons) > 0 {
+				for _, r := range out.Reasons {
+					if r != routing.Selected && r != routing.ReasonNotSelected {
+						reason = r
+						break
+					}
+				}
+			}
+			cors.Apply(w.Header())
+			slog.Warn("proxy request rejected",
+				"id", reqID, "method", r.Method, "path", r.URL.Path,
+				"remote", r.RemoteAddr, "reason", reason)
+			http.Error(w, `{"error":"no eligible endpoint: `+reason+`"}`, http.StatusBadGateway)
+			p.codec.Notify("proxy/request", RequestEvent{
+				ID: reqID, Method: r.Method, Path: r.URL.Path, Target: "cluster",
+				Status: http.StatusBadGateway, Duration: time.Since(start).Milliseconds(), Error: reason,
+			})
+			return
+		}
 		candidates = p.reserveCandidate(candidates)
 	}
 	if r.Method == http.MethodGet && (r.URL.Path == "/api/tags" || r.URL.Path == "/v1/models") {
@@ -1381,6 +1408,11 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 				candBody = rewriteModelAlias(bodyBytes, cand.routing, model)
 			}
 			r.Body = io.NopCloser(bytes.NewReader(candBody))
+			// The alias rewrite can change the body size (a physical model name
+			// differs in length from the client's logical model name). Sync the
+			// outgoing request's content length with the (possibly rewritten) body,
+			// otherwise net/http rejects the send with "ContentLength mismatch".
+			r.ContentLength = int64(len(candBody))
 		}
 		retry := false
 		sc := &statusCapture{ResponseWriter: w, status: http.StatusOK, idle: idleClientWriteTimeout}
@@ -1396,6 +1428,17 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 				if headers := p.authHeadersForCand(cand); len(headers) > 0 {
 					applyAuthHeaders(req, headers)
 				}
+				// Per-endpoint timeout: a slow cold-start endpoint declares a
+				// longer response-header/first-byte budget; a fast endpoint
+				// keeps the default. The context deadline bounds the upstream
+				// dial+header+first-byte for this candidate only. The cancel
+				// is not called here: the ReverseProxy's own transport
+				// ResponseHeaderTimeout and the client's context cancellation
+				// both bound the request's lifetime, and the deadline is
+				// strictly longer than either, so no goroutine leaks.
+				profile := routing.ResolveTimeouts(timeoutSpec(cand.routing))
+				timeoutCtx, _ := context.WithTimeout(req.Context(), profile.Connect+profile.ResponseHeader)
+				req = req.WithContext(timeoutCtx)
 			},
 			// A remote cluster peer is dialed over mTLS (per-peer pinned config);
 			// self/manual candidates use the plain transport. See candidateTransport.
@@ -1743,6 +1786,7 @@ func (p *Proxy) resolveCandidates(model string) []candidate {
 			url:      u,
 			peerUUID: peerUUID,
 			routing:  routingForNode(n),
+			served:   n.Models,
 		})
 	}
 
@@ -1843,6 +1887,22 @@ func nodeAdvertisesModel(n Node, model string) bool {
 	for _, available := range n.Models {
 		if ollamaModelKey(available) == requested {
 			return true
+		}
+	}
+	// Also check the node's declared routing aliases: a logical model name
+	// that maps to a physical model on this node is an advertised model even
+	// if the physical name differs. This prevents the alias rewrite from
+	// happening too late (after the node was already filtered out).
+	if n.Routing != nil {
+		if r := n.Routing[workloadEngine]; r != nil && r.ModelRef != nil {
+			if r.ModelRef.PhysicalName == model {
+				return true
+			}
+			for _, alias := range r.ModelRef.Aliases {
+				if alias == model {
+					return true
+				}
+			}
 		}
 	}
 	return false

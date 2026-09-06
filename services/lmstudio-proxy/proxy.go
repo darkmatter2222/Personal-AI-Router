@@ -733,6 +733,8 @@ type candidate struct {
 	// this proxy fronts (capabilities, aliases, capacity, priority, timeouts,
 	// auth presence). Nil when the node declared none.
 	routing *noderec.EngineRouting
+	// served is the node's model inventory for the engine this proxy fronts.
+	served []string
 }
 
 // routingForNode returns the node's routing metadata for the engine this proxy
@@ -1186,6 +1188,11 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 				candBody = rewriteModelAlias(bodyBytes, cand.routing, model)
 			}
 			r.Body = io.NopCloser(bytes.NewReader(candBody))
+			// The alias rewrite can change the body size (a physical model name
+			// differs in length from the client's logical model name). Sync the
+			// outgoing request's content length with the (possibly rewritten) body,
+			// otherwise net/http rejects the send with "ContentLength mismatch".
+			r.ContentLength = int64(len(candBody))
 		}
 		retry := false
 		sc := &statusCapture{ResponseWriter: w, status: http.StatusOK, idle: idleClientWriteTimeout}
@@ -1201,6 +1208,11 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 				if headers := p.authHeadersForCand(cand); len(headers) > 0 {
 					applyAuthHeaders(req, headers)
 				}
+				// Per-endpoint timeout: bounds the upstream dial+header+first-byte
+				// for this candidate only, derived from its declared timeout spec.
+				profile := routing.ResolveTimeouts(timeoutSpec(cand.routing))
+				timeoutCtx, _ := context.WithTimeout(req.Context(), profile.Connect+profile.ResponseHeader)
+				req = req.WithContext(timeoutCtx)
 			},
 			// A remote cluster peer is dialed over mTLS (per-peer pinned config);
 			// self/manual candidates use the plain transport. See candidateTransport.
@@ -1540,6 +1552,7 @@ func (p *Proxy) resolveCandidates(model string) []candidate {
 			url:      u,
 			peerUUID: peerUUID,
 			routing:  routingForNode(n),
+			served:   n.Models,
 		})
 	}
 
