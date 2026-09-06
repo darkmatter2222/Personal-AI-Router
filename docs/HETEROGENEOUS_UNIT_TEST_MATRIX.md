@@ -119,6 +119,28 @@ conversation size, num_ctx)`), so a request that explicitly asks for a large
 window is gated against a too-small model. Status: STATICALLY VALIDATED, NOT
 EXECUTED.
 
+## Second pass — completion & hardening
+
+New/changed routing-critical functions and their direct tests (all reviewed
+compile-clean; NOT EXECUTED — no Go toolchain).
+
+| Package/file | Function | Tests |
+| --- | --- | --- |
+| routing/forward.go | `attempt` first-byte-timeout fix, `statusForReason`, `pickTransport`, `reserveOn`, `splitConnectionTokens`, ctx-aware `copyStream` | TestForward_FinalCandidateFirstByteTimeoutIsLocal504, _AllFirstByteTimeoutIsLocal504, _NilPoolsIsUnbounded, _NilTransportIsLocal502, _NilResponseBodyCommitsHeaders, _NilTargetResolverSkips, _StreamCancellationReleasesCapacity, _NonTransient5xxTerminal, _PerEndpointTransportSelected, _ConnectionNominatedHeaderStripped |
+| routing/transport.go | `ProfileFor`, `dialerFor`, `TransportFactory.For/Len` | TestProfileFor, TestDialerForConsumesConnectTimeout, TestTransportFactory_PerProfileIsolationAndCaching, _ClonePreservesTemplate |
+| routing/classify.go | default output reserve, `ImageCount`, `satAdd`/`satMul`, num_ctx cap | TestClassify_DefaultOutputReserve, _ExplicitOutputOverridesReserve, _ImageReserve, _OverflowSaturates, TestSaturatingArithmetic (+ fuzz invariants) |
+| routing/validate.go | namespace uniqueness, `validHealthPath` | TestValidate_AliasNamespaceRules, _SameAliasAcrossEndpointsValid, _HealthPath, _ModelNameLengthBoundary |
+| routing/reasons.go | precise execution reasons | (asserted throughout forward tests) |
+| routing/routing_security_test.go | wire cannot carry auth | TestEngineRouting_NeverSerializesAuth, TestLocalAuth_IsSeparateFromEngineRouting |
+| routeadapter/routeadapter.go | `Endpoints`, `Router.Route` (classify→decide→reserve→forward) | TestRoute_LegacyFallbackWhenNoMetadata, _BasicText, _VisionGate, _ToolsGatePrefersCapableOverHigherPriority, _AliasRewrittenToPhysical, _CapacitySpillover, _DeterministicPriority, _DefaultSchedulerOrder, _NoEligibleWritesLocalErrorNoUpstream, _UnhealthyExcluded, _GenericRandomEngine, _MultiModelPerEndpoint |
+| engine-manager/actions.go, lifecycleguard.go | action auth, `resolveActionTimeout`, `actionAllowedForExternal` | TestExternalEngine_ActionGuardBlocksMutationBeforeExecution, TestResolveActionTimeout, TestSlowLoadActionUsesSlowResponseHeaderBudget (reframed) |
+| noderec | routing metadata carries no auth | TestDirectoryNode_RoutingByEngineNeverCarriesAuth |
+
+Offline allowlist now includes `routeadapter` (component tests with a fake
+transport). The engine-manager action tests are dev-box only (that package has
+pre-existing subprocess/TestMain tests); the enforcement decisions they cover are
+also proven offline in the routing package.
+
 ## Not directly unit-tested here (deferred, with rationale)
 
 - **Broker projection** (`directoryToEnriched`/`toAvailable` RoutingByEngine
